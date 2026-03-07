@@ -69,10 +69,13 @@ impl ToolRegistry {
         reg.register(ReadFileTool);
         reg.register(WriteFileTool);
         reg.register(EditFileTool);
+        reg.register(MultiEditTool);
         reg.register(ListDirTool);
         reg.register(BashTool);
         reg.register(GrepTool);
         reg.register(GlobTool);
+        reg.register(WebFetchTool);
+        reg.register(TodoTool::new());
         reg.register(SkillTool::new());
         reg
     }
@@ -631,6 +634,323 @@ impl Tool for GlobTool {
                 results.join("\n")
             },
             is_error: false,
+        }
+    }
+}
+
+// ─── Multi Edit (multiple edits in one file, applied in order) ───
+
+struct MultiEditTool;
+
+impl Tool for MultiEditTool {
+    fn definition(&self) -> ToolDef {
+        ToolDef {
+            name: "multi_edit".into(),
+            description: "Apply multiple find-and-replace edits to a single file in one call. Each edit is applied sequentially. More efficient than multiple edit_file calls.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Path to the file" },
+                    "edits": {
+                        "type": "array",
+                        "description": "Array of edits to apply in order",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_text": { "type": "string", "description": "Exact text to find" },
+                                "new_text": { "type": "string", "description": "Replacement text" }
+                            },
+                            "required": ["old_text", "new_text"]
+                        }
+                    }
+                },
+                "required": ["path", "edits"]
+            }),
+        }
+    }
+
+    fn execute(&self, input: &Value, cwd: &str) -> ToolResult {
+        let path = input["path"].as_str().unwrap_or("");
+        let full_path = resolve_path(cwd, path);
+        let edits = input["edits"].as_array();
+
+        let Some(edits) = edits else {
+            return ToolResult {
+                tool_use_id: String::new(),
+                content: "Error: 'edits' must be an array".into(),
+                is_error: true,
+            };
+        };
+
+        let mut content = match std::fs::read_to_string(&full_path) {
+            Ok(c) => c,
+            Err(e) => {
+                return ToolResult {
+                    tool_use_id: String::new(),
+                    content: format!("Error reading {}: {}", path, e),
+                    is_error: true,
+                };
+            }
+        };
+
+        let mut applied = 0;
+        let mut errors = Vec::new();
+
+        for (i, edit) in edits.iter().enumerate() {
+            let old_text = edit["old_text"].as_str().unwrap_or("");
+            let new_text = edit["new_text"].as_str().unwrap_or("");
+            if content.contains(old_text) {
+                content = content.replacen(old_text, new_text, 1);
+                applied += 1;
+            } else {
+                errors.push(format!("Edit {}: old_text not found", i + 1));
+            }
+        }
+
+        if applied > 0 {
+            if let Err(e) = std::fs::write(&full_path, &content) {
+                return ToolResult {
+                    tool_use_id: String::new(),
+                    content: format!("Error writing {}: {}", path, e),
+                    is_error: true,
+                };
+            }
+        }
+
+        let mut msg = format!("Applied {}/{} edits to {}", applied, edits.len(), path);
+        if !errors.is_empty() {
+            msg.push_str(&format!("\nErrors:\n{}", errors.join("\n")));
+        }
+
+        ToolResult {
+            tool_use_id: String::new(),
+            content: msg,
+            is_error: !errors.is_empty(),
+        }
+    }
+}
+
+// ─── Web Fetch (retrieve URL content) ───
+
+struct WebFetchTool;
+
+impl Tool for WebFetchTool {
+    fn definition(&self) -> ToolDef {
+        ToolDef {
+            name: "web_fetch".into(),
+            description: "Fetch content from a URL. Returns the response body as text. Useful for reading documentation, APIs, or web pages. Uses curl under the hood.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "URL to fetch (http or https)" },
+                    "max_bytes": { "type": "integer", "description": "Maximum response size in bytes (default: 100000)" },
+                    "headers": {
+                        "type": "object",
+                        "description": "Optional HTTP headers as key-value pairs",
+                        "additionalProperties": { "type": "string" }
+                    }
+                },
+                "required": ["url"]
+            }),
+        }
+    }
+
+    fn execute(&self, input: &Value, _cwd: &str) -> ToolResult {
+        let url = input["url"].as_str().unwrap_or("");
+        let max_bytes = input["max_bytes"].as_u64().unwrap_or(100_000);
+
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return ToolResult {
+                tool_use_id: String::new(),
+                content: "Error: URL must start with http:// or https://".into(),
+                is_error: true,
+            };
+        }
+
+        let mut cmd = std::process::Command::new("curl");
+        cmd.args([
+            "-sS",
+            "-L",                    // follow redirects
+            "--max-time", "30",      // 30s timeout
+            "--max-filesize", &max_bytes.to_string(),
+            "-H", "User-Agent: RustPilot/0.1",
+        ]);
+
+        // Add custom headers
+        if let Some(headers) = input["headers"].as_object() {
+            for (key, val) in headers {
+                if let Some(v) = val.as_str() {
+                    cmd.args(["-H", &format!("{}: {}", key, v)]);
+                }
+            }
+        }
+
+        cmd.arg(url);
+
+        match cmd.output() {
+            Ok(output) => {
+                let mut body = String::from_utf8_lossy(&output.stdout).to_string();
+                if body.len() > max_bytes as usize {
+                    body.truncate(max_bytes as usize);
+                    body.push_str("\n... (truncated)");
+                }
+                let stderr = String::from_utf8_lossy(&output.stderr);
+
+                if !output.status.success() {
+                    return ToolResult {
+                        tool_use_id: String::new(),
+                        content: format!("Error fetching {}: {}", url, stderr),
+                        is_error: true,
+                    };
+                }
+
+                ToolResult {
+                    tool_use_id: String::new(),
+                    content: body,
+                    is_error: false,
+                }
+            }
+            Err(e) => ToolResult {
+                tool_use_id: String::new(),
+                content: format!("Error: curl not available or failed: {}", e),
+                is_error: true,
+            },
+        }
+    }
+}
+
+// ─── Todo (task tracking within a session) ───
+
+struct TodoTool {
+    todos: std::sync::Arc<std::sync::Mutex<Vec<TodoItem>>>,
+}
+
+#[derive(Debug, Clone)]
+struct TodoItem {
+    id: usize,
+    text: String,
+    status: TodoStatus,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum TodoStatus {
+    Pending,
+    InProgress,
+    Done,
+}
+
+impl std::fmt::Display for TodoStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TodoStatus::Pending => write!(f, "⬚"),
+            TodoStatus::InProgress => write!(f, "◑"),
+            TodoStatus::Done => write!(f, "✓"),
+        }
+    }
+}
+
+impl TodoTool {
+    fn new() -> Self {
+        Self {
+            todos: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl Tool for TodoTool {
+    fn definition(&self) -> ToolDef {
+        ToolDef {
+            name: "todo".into(),
+            description: "Track tasks and progress. Actions: 'add' (create task), 'update' (change status), 'list' (show all tasks). Use this to plan multi-step work and track what's done.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["add", "update", "list"],
+                        "description": "Action to perform"
+                    },
+                    "text": { "type": "string", "description": "Task description (for 'add')" },
+                    "id": { "type": "integer", "description": "Task ID (for 'update')" },
+                    "status": {
+                        "type": "string",
+                        "enum": ["pending", "in_progress", "done"],
+                        "description": "New status (for 'update')"
+                    }
+                },
+                "required": ["action"]
+            }),
+        }
+    }
+
+    fn execute(&self, input: &Value, _cwd: &str) -> ToolResult {
+        let action = input["action"].as_str().unwrap_or("list");
+        let mut todos = self.todos.lock().unwrap();
+
+        match action {
+            "add" => {
+                let text = input["text"].as_str().unwrap_or("(untitled)");
+                let id = todos.len() + 1;
+                todos.push(TodoItem {
+                    id,
+                    text: text.to_string(),
+                    status: TodoStatus::Pending,
+                });
+                ToolResult {
+                    tool_use_id: String::new(),
+                    content: format!("Added task #{}: {}", id, text),
+                    is_error: false,
+                }
+            }
+            "update" => {
+                let id = input["id"].as_u64().unwrap_or(0) as usize;
+                let status_str = input["status"].as_str().unwrap_or("done");
+                let status = match status_str {
+                    "pending" => TodoStatus::Pending,
+                    "in_progress" => TodoStatus::InProgress,
+                    "done" => TodoStatus::Done,
+                    _ => TodoStatus::Pending,
+                };
+
+                if let Some(item) = todos.iter_mut().find(|t| t.id == id) {
+                    item.status = status;
+                    ToolResult {
+                        tool_use_id: String::new(),
+                        content: format!("Updated task #{} → {}", id, item.status),
+                        is_error: false,
+                    }
+                } else {
+                    ToolResult {
+                        tool_use_id: String::new(),
+                        content: format!("Task #{} not found", id),
+                        is_error: true,
+                    }
+                }
+            }
+            "list" | _ => {
+                if todos.is_empty() {
+                    return ToolResult {
+                        tool_use_id: String::new(),
+                        content: "No tasks.".into(),
+                        is_error: false,
+                    };
+                }
+                let list: Vec<String> = todos
+                    .iter()
+                    .map(|t| format!("  {} #{}: {}", t.status, t.id, t.text))
+                    .collect();
+
+                let done = todos.iter().filter(|t| t.status == TodoStatus::Done).count();
+                let total = todos.len();
+                let mut output = list.join("\n");
+                output.push_str(&format!("\n\nProgress: {}/{}", done, total));
+
+                ToolResult {
+                    tool_use_id: String::new(),
+                    content: output,
+                    is_error: false,
+                }
+            }
         }
     }
 }
