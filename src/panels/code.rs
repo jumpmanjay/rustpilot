@@ -3,16 +3,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use super::editor::TextBuffer;
 use super::prompt::PromptPanel;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CodeView {
-    Explorer,
-    Editor,
-    // Future: Diff, Search
-}
-
 pub struct CodePanel {
-    pub view: CodeView,
-
     // File explorer state
     pub cwd: String,
     pub entries: Vec<FileEntry>,
@@ -43,7 +34,6 @@ impl CodePanel {
             .unwrap_or_else(|_| ".".to_string());
 
         let mut panel = Self {
-            view: CodeView::Explorer,
             cwd: cwd.clone(),
             entries: Vec::new(),
             selected_idx: 0,
@@ -72,7 +62,6 @@ impl CodePanel {
                     }
                 })
                 .collect();
-            // Dirs first, then alphabetical
             items.sort_by(|a, b| {
                 b.is_dir
                     .cmp(&a.is_dir)
@@ -86,18 +75,11 @@ impl CodePanel {
         if let Ok(content) = std::fs::read_to_string(path) {
             self.file_path = Some(path.to_string());
             self.buffer = TextBuffer::from_string(&content);
-            self.view = CodeView::Editor;
         }
     }
 
-    pub fn handle_key(&mut self, key: KeyEvent, prompt: &mut PromptPanel) {
-        match self.view {
-            CodeView::Explorer => self.handle_explorer_key(key, prompt),
-            CodeView::Editor => self.handle_editor_key(key, prompt),
-        }
-    }
-
-    fn handle_explorer_key(&mut self, key: KeyEvent, prompt: &mut PromptPanel) {
+    /// Public explorer key handler (called from App when Explorer panel is focused)
+    pub fn handle_explorer_key_pub(&mut self, key: KeyEvent, prompt: &mut PromptPanel) {
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.selected_idx > 0 {
@@ -127,13 +109,11 @@ impl CodePanel {
                     self.refresh_entries();
                 }
             }
-            // Ctrl+R: send selected path as tag reference to prompt
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(entry) = self.entries.get(self.selected_idx) {
                     prompt.insert_reference(&format!("@{}", entry.path), false);
                 }
             }
-            // Ctrl+Shift+R: send as include reference
             KeyCode::Char('R') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(entry) = self.entries.get(self.selected_idx) {
                     prompt.insert_reference(&format!("@@{}", entry.path), true);
@@ -143,22 +123,15 @@ impl CodePanel {
         }
     }
 
-    fn handle_editor_key(&mut self, key: KeyEvent, prompt: &mut PromptPanel) {
+    /// Public editor key handler (called from App when Editor panel is focused)
+    pub fn handle_editor_key_pub(&mut self, key: KeyEvent, prompt: &mut PromptPanel) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
-        // Editor-specific keybinds (before passing to TextBuffer)
         match key.code {
-            // Save: Ctrl+S
             KeyCode::Char('s') if ctrl => {
                 self.save_file();
                 return;
             }
-            // Back to explorer: Ctrl+E
-            KeyCode::Char('e') if ctrl => {
-                self.view = CodeView::Explorer;
-                return;
-            }
-            // Send tag reference: Ctrl+R
             KeyCode::Char('r') if ctrl => {
                 if let Some(ref path) = self.file_path {
                     let line_ref = self.make_line_ref(path, "@");
@@ -166,7 +139,6 @@ impl CodePanel {
                 }
                 return;
             }
-            // Send include reference: Ctrl+Shift+R
             KeyCode::Char('R') if ctrl => {
                 if let Some(ref path) = self.file_path {
                     let line_ref = self.make_line_ref(path, "@@");
@@ -177,7 +149,6 @@ impl CodePanel {
             _ => {}
         }
 
-        // Delegate to TextBuffer
         self.buffer.handle_key(key, self.viewport_height);
     }
 

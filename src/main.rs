@@ -88,12 +88,13 @@ async fn run_app(
                     app.quit_confirm = false;
                 }
 
-                // Global: Alt+F1/F2/F3 toggle panels, Alt+` cycle focus
+                // Global: Alt+F1/F2/F3/F4 toggle panels, Alt+` cycle focus
                 if key.modifiers.contains(KeyModifiers::ALT) {
                     match key.code {
-                        KeyCode::F(1) => { app.toggle_panel(panels::PanelId::Code); continue; }
-                        KeyCode::F(2) => { app.toggle_panel(panels::PanelId::Llm); continue; }
-                        KeyCode::F(3) => { app.toggle_panel(panels::PanelId::Prompt); continue; }
+                        KeyCode::F(1) => { app.toggle_panel(panels::PanelId::Explorer); continue; }
+                        KeyCode::F(2) => { app.toggle_panel(panels::PanelId::Editor); continue; }
+                        KeyCode::F(3) => { app.toggle_panel(panels::PanelId::Llm); continue; }
+                        KeyCode::F(4) => { app.toggle_panel(panels::PanelId::Prompt); continue; }
                         KeyCode::Char('`') => { app.cycle_focus(); continue; }
                         _ => {}
                     }

@@ -9,7 +9,8 @@ pub use prompt::PromptPanel;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanelId {
-    Code = 0,
-    Llm = 1,
-    Prompt = 2,
+    Explorer = 0,
+    Editor = 1,
+    Llm = 2,
+    Prompt = 3,
 }
