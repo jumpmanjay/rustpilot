@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::App;
+use crate::app::{App, GrepResult, Overlay};
 use crate::panels::editor::TextBuffer;
 use crate::panels::prompt::PromptView;
 use crate::panels::PanelId;
@@ -121,6 +121,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             }
             _ => {}
         }
+    }
+
+    // Draw overlay on top of everything
+    if app.overlay.is_some() {
+        draw_overlay(f, app);
     }
 }
 
@@ -441,4 +446,174 @@ fn short_path(path: &str) -> &str {
     let parts: Vec<&str> = path.rsplit('/').take(3).collect();
     let start = path.len().saturating_sub(parts.iter().map(|p| p.len() + 1).sum::<usize>());
     &path[start..]
+}
+
+// ─── Overlay Rendering ───
+
+fn draw_overlay(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let width = (area.width * 2 / 3).min(80).max(40);
+    let height = (area.height / 2).min(20).max(8);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + 2; // near top, like VS Code
+
+    let overlay_area = Rect::new(x, y, width, height);
+    f.render_widget(Clear, overlay_area);
+
+    match &app.overlay {
+        Some(Overlay::FileFinder {
+            query,
+            results,
+            selected,
+        }) => {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(" Find File (Ctrl+P) ");
+            let inner = block.inner(overlay_area);
+            f.render_widget(block, overlay_area);
+
+            // Search input + results
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(1)])
+                .split(inner);
+
+            // Input line
+            let input = Paragraph::new(Line::from(vec![
+                Span::styled("> ", Style::default().fg(Color::Cyan)),
+                Span::styled(query.as_str(), Style::default().fg(Color::White)),
+                Span::styled("█", Style::default().fg(Color::Gray)),
+            ]));
+            f.render_widget(input, chunks[0]);
+
+            // Results
+            let max_visible = chunks[1].height as usize;
+            let items: Vec<ListItem> = results
+                .iter()
+                .enumerate()
+                .take(max_visible)
+                .map(|(i, path)| {
+                    let style = if i == *selected {
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    ListItem::new(Line::from(Span::styled(path.as_str(), style)))
+                })
+                .collect();
+            f.render_widget(List::new(items), chunks[1]);
+        }
+
+        Some(Overlay::FindInFile {
+            query,
+            matches,
+            current,
+        }) => {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(format!(
+                    " Find in File — {}/{} matches ",
+                    if matches.is_empty() { 0 } else { *current + 1 },
+                    matches.len()
+                ));
+            let inner = block.inner(overlay_area);
+            f.render_widget(block, overlay_area);
+
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(1)])
+                .split(inner);
+
+            let input = Paragraph::new(Line::from(vec![
+                Span::styled("🔍 ", Style::default().fg(Color::Yellow)),
+                Span::styled(query.as_str(), Style::default().fg(Color::White)),
+                Span::styled("█", Style::default().fg(Color::Gray)),
+            ]));
+            f.render_widget(input, chunks[0]);
+
+            // Show matches with context
+            let max_visible = chunks[1].height as usize;
+            let items: Vec<ListItem> = matches
+                .iter()
+                .enumerate()
+                .take(max_visible)
+                .map(|(i, (row, col))| {
+                    let style = if i == *current {
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let line_text = app
+                        .code_panel
+                        .buffer
+                        .lines
+                        .get(*row)
+                        .map(|l| l.trim())
+                        .unwrap_or("");
+                    ListItem::new(Line::from(Span::styled(
+                        format!("  {}:{} {}", row + 1, col + 1, line_text),
+                        style,
+                    )))
+                })
+                .collect();
+            f.render_widget(List::new(items), chunks[1]);
+        }
+
+        Some(Overlay::FindInWorkspace {
+            query,
+            results,
+            selected,
+        }) => {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Magenta))
+                .title(format!(" Find in Workspace — {} results ", results.len()));
+            let inner = block.inner(overlay_area);
+            f.render_widget(block, overlay_area);
+
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(1)])
+                .split(inner);
+
+            let input = Paragraph::new(Line::from(vec![
+                Span::styled("🔍 ", Style::default().fg(Color::Magenta)),
+                Span::styled(query.as_str(), Style::default().fg(Color::White)),
+                Span::styled("█", Style::default().fg(Color::Gray)),
+            ]));
+            f.render_widget(input, chunks[0]);
+
+            let max_visible = chunks[1].height as usize;
+            let items: Vec<ListItem> = results
+                .iter()
+                .enumerate()
+                .take(max_visible)
+                .map(|(i, result)| {
+                    let style = if i == *selected {
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    let text = format!(
+                        "  {}:{} {}",
+                        result.path,
+                        result.line_num,
+                        result.line_text.trim()
+                    );
+                    // Truncate long lines
+                    let truncated = if text.len() > width as usize - 4 {
+                        format!("{}…", &text[..width as usize - 5])
+                    } else {
+                        text
+                    };
+                    ListItem::new(Line::from(Span::styled(truncated, style)))
+                })
+                .collect();
+            f.render_widget(List::new(items), chunks[1]);
+        }
+
+        None => {}
+    }
 }

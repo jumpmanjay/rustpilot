@@ -88,6 +88,22 @@ async fn run_app(
                     app.quit_confirm = false;
                 }
 
+                // Handle overlay input (file finder, search, etc.)
+                if app.overlay.is_some() {
+                    app.handle_overlay_key(key);
+                    continue;
+                }
+
+                // Global: Ctrl+P file finder, Ctrl+F find in file, Ctrl+Shift+F find in workspace
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    match key.code {
+                        KeyCode::Char('p') => { app.open_file_finder(); continue; }
+                        KeyCode::Char('f') => { app.open_find_in_file(); continue; }
+                        KeyCode::Char('F') => { app.open_find_in_workspace(); continue; }
+                        _ => {}
+                    }
+                }
+
                 // Global: Alt+F1/F2/F3/F4 toggle panels, Alt+` cycle focus
                 if key.modifiers.contains(KeyModifiers::ALT) {
                     match key.code {

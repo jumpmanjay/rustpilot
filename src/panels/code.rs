@@ -48,9 +48,25 @@ impl CodePanel {
 
     pub fn refresh_entries(&mut self) {
         self.entries.clear();
+
+        // Add ../ entry if not at root
+        if let Some(parent) = std::path::Path::new(&self.cwd).parent() {
+            self.entries.push(FileEntry {
+                name: "..".to_string(),
+                path: parent.to_string_lossy().to_string(),
+                is_dir: true,
+                depth: 0,
+                expanded: false,
+            });
+        }
+
         if let Ok(rd) = std::fs::read_dir(&self.cwd) {
             let mut items: Vec<_> = rd
                 .filter_map(|e| e.ok())
+                .filter(|e| {
+                    // Hide dotfiles by default
+                    !e.file_name().to_string_lossy().starts_with('.')
+                })
                 .map(|e| {
                     let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
                     FileEntry {
@@ -67,7 +83,7 @@ impl CodePanel {
                     .cmp(&a.is_dir)
                     .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
             });
-            self.entries = items;
+            self.entries.extend(items);
         }
     }
 

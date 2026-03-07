@@ -28,6 +28,38 @@ pub struct App {
     pub panel_rects: Vec<(PanelId, Rect)>,
     /// Whether mouse is currently dragging (for selection)
     pub mouse_dragging: bool,
+
+    /// Double-click tracking
+    pub last_click: Option<(std::time::Instant, PanelId, u16, u16)>,
+
+    /// Overlay mode (file finder, search, etc.)
+    pub overlay: Option<Overlay>,
+}
+
+#[derive(Debug)]
+pub enum Overlay {
+    FileFinder {
+        query: String,
+        results: Vec<String>,
+        selected: usize,
+    },
+    FindInFile {
+        query: String,
+        matches: Vec<(usize, usize)>, // (row, col)
+        current: usize,
+    },
+    FindInWorkspace {
+        query: String,
+        results: Vec<GrepResult>,
+        selected: usize,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct GrepResult {
+    pub path: String,
+    pub line_num: usize,
+    pub line_text: String,
 }
 
 impl App {
@@ -49,6 +81,8 @@ impl App {
             quit_confirm: false,
             panel_rects: Vec::new(),
             mouse_dragging: false,
+            last_click: None,
+            overlay: None,
         })
     }
 
@@ -92,6 +126,272 @@ impl App {
         self.llm.poll_updates(&mut self.llm_panel);
     }
 
+    // ─── Overlay: File Finder (Ctrl+P) ───
+
+    pub fn open_file_finder(&mut self) {
+        self.overlay = Some(Overlay::FileFinder {
+            query: String::new(),
+            results: Vec::new(),
+            selected: 0,
+        });
+    }
+
+    fn file_finder_search(cwd: &str, query: &str) -> Vec<String> {
+        use ignore::WalkBuilder;
+
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let query_lower = query.to_lowercase();
+        let mut results = Vec::new();
+
+        let walker = WalkBuilder::new(cwd)
+            .hidden(true) // respect .gitignore + skip hidden
+            .max_depth(Some(10))
+            .build();
+
+        for entry in walker.flatten() {
+            if entry.file_type().map_or(true, |ft| ft.is_dir()) {
+                continue;
+            }
+            let path = entry.path().to_string_lossy();
+            let relative = path
+                .strip_prefix(cwd)
+                .unwrap_or(&path)
+                .trim_start_matches('/');
+            if relative.to_lowercase().contains(&query_lower) {
+                results.push(relative.to_string());
+                if results.len() >= 50 {
+                    break;
+                }
+            }
+        }
+        results
+    }
+
+    // ─── Overlay: Find in File (Ctrl+F) ───
+
+    pub fn open_find_in_file(&mut self) {
+        self.overlay = Some(Overlay::FindInFile {
+            query: String::new(),
+            matches: Vec::new(),
+            current: 0,
+        });
+    }
+
+    fn find_in_file_search(lines: &[String], query: &str) -> Vec<(usize, usize)> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let query_lower = query.to_lowercase();
+        let mut matches = Vec::new();
+        for (row, line) in lines.iter().enumerate() {
+            let line_lower = line.to_lowercase();
+            let mut start = 0;
+            while let Some(pos) = line_lower[start..].find(&query_lower) {
+                matches.push((row, start + pos));
+                start += pos + query_lower.len();
+            }
+        }
+        matches
+    }
+
+    // ─── Overlay: Find in Workspace (Ctrl+Shift+F) ───
+
+    pub fn open_find_in_workspace(&mut self) {
+        self.overlay = Some(Overlay::FindInWorkspace {
+            query: String::new(),
+            results: Vec::new(),
+            selected: 0,
+        });
+    }
+
+    fn find_in_workspace_search(cwd: &str, query: &str) -> Vec<GrepResult> {
+        use ignore::WalkBuilder;
+
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let query_lower = query.to_lowercase();
+        let mut results = Vec::new();
+
+        let walker = WalkBuilder::new(cwd)
+            .hidden(true)
+            .max_depth(Some(10))
+            .build();
+
+        for entry in walker.flatten() {
+            if entry.file_type().map_or(true, |ft| ft.is_dir()) {
+                continue;
+            }
+            let path = entry.path();
+            if let Ok(content) = std::fs::read_to_string(path) {
+                let relative = path
+                    .to_string_lossy()
+                    .strip_prefix(cwd)
+                    .unwrap_or(&path.to_string_lossy())
+                    .trim_start_matches('/')
+                    .to_string();
+                for (i, line) in content.lines().enumerate() {
+                    if line.to_lowercase().contains(&query_lower) {
+                        results.push(GrepResult {
+                            path: relative.clone(),
+                            line_num: i + 1,
+                            line_text: line.to_string(),
+                        });
+                        if results.len() >= 100 {
+                            return results;
+                        }
+                    }
+                }
+            }
+        }
+        results
+    }
+
+    // ─── Overlay Key Handling ───
+
+    pub fn handle_overlay_key(&mut self, key: KeyEvent) {
+        use crossterm::event::KeyCode;
+
+        // Common: Esc closes any overlay
+        if key.code == KeyCode::Esc {
+            self.overlay = None;
+            return;
+        }
+
+        match self.overlay {
+            Some(Overlay::FileFinder {
+                ref mut query,
+                ref mut results,
+                ref mut selected,
+            }) => {
+                match key.code {
+                    KeyCode::Enter => {
+                        if let Some(path) = results.get(*selected).cloned() {
+                            let full_path = format!("{}/{}", self.code_panel.cwd, path);
+                            self.code_panel.open_file(&full_path);
+                            self.focused = PanelId::Editor;
+                        }
+                        self.overlay = None;
+                    }
+                    KeyCode::Up => *selected = selected.saturating_sub(1),
+                    KeyCode::Down => {
+                        if *selected + 1 < results.len() {
+                            *selected += 1;
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        query.pop();
+                        *results = Self::file_finder_search(&self.code_panel.cwd, query);
+                        *selected = 0;
+                    }
+                    KeyCode::Char(c) => {
+                        query.push(c);
+                        *results = Self::file_finder_search(&self.code_panel.cwd, query);
+                        *selected = 0;
+                    }
+                    _ => {}
+                }
+            }
+
+            Some(Overlay::FindInFile {
+                ref mut query,
+                ref mut matches,
+                ref mut current,
+            }) => {
+                match key.code {
+                    KeyCode::Enter => {
+                        if let Some(&(row, col)) = matches.get(*current) {
+                            self.code_panel.buffer.cursor_row = row;
+                            self.code_panel.buffer.cursor_col = col;
+                            self.code_panel.buffer.select_anchor = None;
+                            self.focused = PanelId::Editor;
+                        }
+                        if !matches.is_empty() {
+                            *current = (*current + 1) % matches.len();
+                        }
+                    }
+                    KeyCode::Up => {
+                        if !matches.is_empty() {
+                            *current = if *current == 0 { matches.len() - 1 } else { *current - 1 };
+                            if let Some(&(row, col)) = matches.get(*current) {
+                                self.code_panel.buffer.cursor_row = row;
+                                self.code_panel.buffer.cursor_col = col;
+                            }
+                        }
+                    }
+                    KeyCode::Down => {
+                        if !matches.is_empty() {
+                            *current = (*current + 1) % matches.len();
+                            if let Some(&(row, col)) = matches.get(*current) {
+                                self.code_panel.buffer.cursor_row = row;
+                                self.code_panel.buffer.cursor_col = col;
+                            }
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        query.pop();
+                        *matches = Self::find_in_file_search(&self.code_panel.buffer.lines, query);
+                        *current = 0;
+                        if let Some(&(row, col)) = matches.first() {
+                            self.code_panel.buffer.cursor_row = row;
+                            self.code_panel.buffer.cursor_col = col;
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        query.push(c);
+                        *matches = Self::find_in_file_search(&self.code_panel.buffer.lines, query);
+                        *current = 0;
+                        if let Some(&(row, col)) = matches.first() {
+                            self.code_panel.buffer.cursor_row = row;
+                            self.code_panel.buffer.cursor_col = col;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            Some(Overlay::FindInWorkspace {
+                ref mut query,
+                ref mut results,
+                ref mut selected,
+            }) => {
+                match key.code {
+                    KeyCode::Enter => {
+                        if let Some(result) = results.get(*selected).cloned() {
+                            let full_path = format!("{}/{}", self.code_panel.cwd, result.path);
+                            self.code_panel.open_file(&full_path);
+                            self.code_panel.buffer.cursor_row = result.line_num.saturating_sub(1);
+                            self.code_panel.buffer.cursor_col = 0;
+                            self.focused = PanelId::Editor;
+                        }
+                        self.overlay = None;
+                    }
+                    KeyCode::Up => *selected = selected.saturating_sub(1),
+                    KeyCode::Down => {
+                        if *selected + 1 < results.len() {
+                            *selected += 1;
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        query.pop();
+                        *results = Self::find_in_workspace_search(&self.code_panel.cwd, query);
+                        *selected = 0;
+                    }
+                    KeyCode::Char(c) => {
+                        query.push(c);
+                        *results = Self::find_in_workspace_search(&self.code_panel.cwd, query);
+                        *selected = 0;
+                    }
+                    _ => {}
+                }
+            }
+
+            None => {}
+        }
+    }
+
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
         let x = mouse.column;
         let y = mouse.row;
@@ -132,6 +432,13 @@ impl App {
                     let lx = x.saturating_sub(rect.x + 1);
                     let ly = y.saturating_sub(rect.y + 1);
 
+                    // Detect double-click (within 400ms, same panel, same position)
+                    let now = std::time::Instant::now();
+                    let is_double = self.last_click.map_or(false, |(t, pid, px, py)| {
+                        pid == panel_id && px == x && py == y && now.duration_since(t).as_millis() < 400
+                    });
+                    self.last_click = Some((now, panel_id, x, y));
+
                     match panel_id {
                         PanelId::Editor => {
                             click_to_cursor(&mut self.code_panel.buffer, lx, ly, 5, true);
@@ -140,6 +447,19 @@ impl App {
                             let idx = ly as usize + self.code_panel.tree_scroll;
                             if idx < self.code_panel.entries.len() {
                                 self.code_panel.selected_idx = idx;
+                                if is_double {
+                                    // Double-click: open file or enter directory
+                                    if let Some(entry) = self.code_panel.entries.get(idx).cloned() {
+                                        if entry.is_dir {
+                                            self.code_panel.cwd = entry.path;
+                                            self.code_panel.selected_idx = 0;
+                                            self.code_panel.refresh_entries();
+                                        } else {
+                                            self.code_panel.open_file(&entry.path);
+                                            self.focused = PanelId::Editor;
+                                        }
+                                    }
+                                }
                             }
                         }
                         PanelId::Prompt => {
