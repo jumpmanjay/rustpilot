@@ -9,7 +9,10 @@ mod ui;
 use anyhow::Result;
 use app::App;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers,
+        MouseButton, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -55,7 +58,19 @@ async fn run_app(
 
         // Poll for events with a small timeout so we can check async channels
         if event::poll(std::time::Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
+            let ev = event::read()?;
+
+            // Handle mouse events
+            if let Event::Mouse(mouse) = ev {
+                if app.quit_confirm {
+                    app.quit_confirm = false;
+                    continue;
+                }
+                app.handle_mouse(mouse);
+                continue;
+            }
+
+            if let Event::Key(key) = ev {
                 // Global quit: Ctrl+Q (with confirmation)
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     && key.code == KeyCode::Char('q')
@@ -86,7 +101,7 @@ async fn run_app(
 
                 // Delegate to focused panel
                 app.handle_key(key);
-            } else if let Event::Resize(_, _) = event::read()? {
+            } else if let Event::Resize(_, _) = ev {
                 // Terminal will redraw on next loop
             }
         }

@@ -54,9 +54,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .constraints(constraints)
         .split(f.area());
 
+    // Store panel rects for mouse hit-testing
+    app.panel_rects.clear();
     for (i, panel_id) in visible.iter().enumerate() {
         let is_focused = *panel_id == app.focused;
         let area = chunks[i];
+        app.panel_rects.push((*panel_id, area));
 
         match panel_id {
             PanelId::Code => draw_code_panel(f, app, area, is_focused),
