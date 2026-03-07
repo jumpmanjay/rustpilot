@@ -3,26 +3,25 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::sync::Mutex;
 
-/// Fallback clipboard shared across all TextBuffer instances
+/// Internal clipboard shared across all TextBuffer instances.
+/// Always used for in-app copy/paste. System clipboard is set as a bonus.
 static INTERNAL_CLIPBOARD: Mutex<String> = Mutex::new(String::new());
 
 fn clipboard_set(text: &str) {
-    // Try system clipboard first, fall back to internal
-    if cli_clipboard::set_contents(text.to_string()).is_err() {
-        if let Ok(mut cb) = INTERNAL_CLIPBOARD.lock() {
-            *cb = text.to_string();
-        }
+    // Always set internal clipboard
+    if let Ok(mut cb) = INTERNAL_CLIPBOARD.lock() {
+        *cb = text.to_string();
     }
+    // Also try system clipboard (best-effort)
+    let _ = cli_clipboard::set_contents(text.to_string());
 }
 
 fn clipboard_get() -> String {
-    // Try system clipboard first, fall back to internal
-    cli_clipboard::get_contents().unwrap_or_else(|_| {
-        INTERNAL_CLIPBOARD
-            .lock()
-            .map(|cb| cb.clone())
-            .unwrap_or_default()
-    })
+    // Always read from internal clipboard (what was copied in-app)
+    INTERNAL_CLIPBOARD
+        .lock()
+        .map(|cb| cb.clone())
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone)]
