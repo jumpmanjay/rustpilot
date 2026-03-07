@@ -94,12 +94,13 @@ async fn run_app(
                     continue;
                 }
 
-                // Global: Ctrl+P file finder, Ctrl+F find in file, Ctrl+Shift+F find in workspace
+                // Global: Ctrl+P file finder, Ctrl+F find in file, Ctrl+Shift+F find in workspace, Ctrl+G source control
                 if key.modifiers.contains(KeyModifiers::CONTROL) {
                     match key.code {
                         KeyCode::Char('p') => { app.open_file_finder(); continue; }
                         KeyCode::Char('f') => { app.open_find_in_file(); continue; }
                         KeyCode::Char('F') => { app.open_find_in_workspace(); continue; }
+                        KeyCode::Char('g') => { app.code_panel.toggle_mode(); continue; }
                         _ => {}
                     }
                 }

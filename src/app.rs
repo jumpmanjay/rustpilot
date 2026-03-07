@@ -114,9 +114,20 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        use crate::panels::code::EditorMode;
         match self.focused {
-            PanelId::Explorer => self.code_panel.handle_explorer_key_pub(key, &mut self.prompt_panel),
-            PanelId::Editor => self.code_panel.handle_editor_key_pub(key, &mut self.prompt_panel),
+            PanelId::Explorer => {
+                match self.code_panel.mode {
+                    EditorMode::Files => self.code_panel.handle_explorer_key_pub(key, &mut self.prompt_panel),
+                    EditorMode::SourceControl => self.code_panel.handle_scm_explorer_key(key),
+                }
+            }
+            PanelId::Editor => {
+                match self.code_panel.mode {
+                    EditorMode::Files => self.code_panel.handle_editor_key_pub(key, &mut self.prompt_panel),
+                    EditorMode::SourceControl => self.code_panel.handle_scm_diff_key(key),
+                }
+            }
             PanelId::Llm => self.llm_panel.handle_key(key),
             PanelId::Prompt => self.prompt_panel.handle_key(key, &mut self.llm, &mut self.store),
         }

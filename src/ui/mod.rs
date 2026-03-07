@@ -7,6 +7,7 @@ use ratatui::{
 };
 
 use crate::app::{App, GrepResult, Overlay};
+use crate::panels::code::{DiffLineKind, EditorMode, ScmStatus};
 use crate::panels::editor::TextBuffer;
 use crate::panels::prompt::PromptView;
 use crate::panels::PanelId;
@@ -91,11 +92,17 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         match *panel_name {
             "explorer" => {
                 app.panel_rects.push((PanelId::Explorer, chunk));
-                draw_explorer(f, app, chunk, app.focused == PanelId::Explorer);
+                match app.code_panel.mode {
+                    EditorMode::Files => draw_explorer(f, app, chunk, app.focused == PanelId::Explorer),
+                    EditorMode::SourceControl => draw_scm_explorer(f, app, chunk, app.focused == PanelId::Explorer),
+                }
             }
             "editor" => {
                 app.panel_rects.push((PanelId::Editor, chunk));
-                draw_editor(f, app, chunk, app.focused == PanelId::Editor);
+                match app.code_panel.mode {
+                    EditorMode::Files => draw_editor(f, app, chunk, app.focused == PanelId::Editor),
+                    EditorMode::SourceControl => draw_scm_diff(f, app, chunk, app.focused == PanelId::Editor),
+                }
             }
             "right" => {
                 // Split right pane vertically: LLM top 2/3, Prompt bottom 1/3
@@ -464,6 +471,123 @@ fn draw_prompt_browser(f: &mut Frame, app: &App, area: Rect) {
 }
 
 // ─── Helpers ───
+
+// ─── Source Control Explorer ───
+
+fn draw_scm_explorer(f: &mut Frame, app: &App, area: Rect, focused: bool) {
+    let scm = &app.code_panel.scm;
+    let title = format!(
+        " SCM: {} [+{} ~{} ?{}] ",
+        if scm.branch.is_empty() { "detached" } else { &scm.branch },
+        scm.staged,
+        scm.unstaged,
+        scm.untracked
+    );
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(panel_border_style(focused))
+        .title(title);
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if scm.entries.is_empty() {
+        f.render_widget(
+            Paragraph::new("No changes.\n\nPress 'r' to refresh\nCtrl+G to go back")
+                .style(Style::default().fg(Color::DarkGray)),
+            inner,
+        );
+        return;
+    }
+
+    let height = inner.height as usize;
+    let scroll = if scm.selected_idx >= height {
+        scm.selected_idx - height + 1
+    } else {
+        0
+    };
+
+    let items: Vec<ListItem> = scm
+        .entries
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(height)
+        .map(|(i, entry)| {
+            let (icon, color) = match entry.status {
+                ScmStatus::Modified => ("M", Color::Yellow),
+                ScmStatus::Added => ("A", Color::Green),
+                ScmStatus::Deleted => ("D", Color::Red),
+                ScmStatus::Renamed => ("R", Color::Blue),
+                ScmStatus::Untracked => ("?", Color::DarkGray),
+            };
+            let staged_marker = if entry.staged { "●" } else { " " };
+            let style = if i == scm.selected_idx {
+                Style::default().fg(color).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(color)
+            };
+            ListItem::new(Line::from(Span::styled(
+                format!("{} {} {}", staged_marker, icon, entry.path),
+                style,
+            )))
+        })
+        .collect();
+
+    f.render_widget(List::new(items), inner);
+}
+
+// ─── Source Control Diff View ───
+
+fn draw_scm_diff(f: &mut Frame, app: &App, area: Rect, focused: bool) {
+    let scm = &app.code_panel.scm;
+    let title = if let Some(entry) = scm.entries.get(scm.selected_idx) {
+        format!(" Diff: {} ", entry.path)
+    } else {
+        " Diff ".to_string()
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(panel_border_style(focused))
+        .title(title);
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if scm.diff_lines.is_empty() {
+        f.render_widget(
+            Paragraph::new("Select a file to view diff")
+                .style(Style::default().fg(Color::DarkGray)),
+            inner,
+        );
+        return;
+    }
+
+    let height = inner.height as usize;
+    let start = scm.diff_scroll;
+    let end = (start + height).min(scm.diff_lines.len());
+
+    let lines: Vec<Line> = scm.diff_lines[start..end]
+        .iter()
+        .map(|dl| {
+            let (color, bg) = match dl.kind {
+                DiffLineKind::Added => (Color::Green, None),
+                DiffLineKind::Removed => (Color::Red, None),
+                DiffLineKind::Header => (Color::Cyan, None),
+                DiffLineKind::Context => (Color::White, None),
+            };
+            let mut style = Style::default().fg(color);
+            if let Some(bg_color) = bg {
+                style = style.bg(bg_color);
+            }
+            Line::from(Span::styled(&dl.text, style))
+        })
+        .collect();
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
 
 fn short_path(path: &str) -> &str {
     let parts: Vec<&str> = path.rsplit('/').take(3).collect();

@@ -4,7 +4,15 @@ use std::collections::HashMap;
 use super::editor::TextBuffer;
 use super::prompt::PromptPanel;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorMode {
+    Files,
+    SourceControl,
+}
+
 pub struct CodePanel {
+    pub mode: EditorMode,
+
     // File explorer state
     pub cwd: String,
     pub entries: Vec<FileEntry>,
@@ -18,8 +26,56 @@ pub struct CodePanel {
     // Open file buffers — preserves unsaved changes when switching files
     pub open_buffers: HashMap<String, TextBuffer>,
 
+    // Source control state
+    pub scm: ScmState,
+
     // Viewport size (set during render)
     pub viewport_height: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScmState {
+    pub entries: Vec<ScmEntry>,
+    pub selected_idx: usize,
+    /// The diff content for the currently selected file
+    pub diff_lines: Vec<DiffLine>,
+    pub diff_scroll: usize,
+    /// Current branch name
+    pub branch: String,
+    /// Summary counts
+    pub staged: usize,
+    pub unstaged: usize,
+    pub untracked: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScmEntry {
+    pub path: String,
+    pub status: ScmStatus,
+    pub staged: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScmStatus {
+    Modified,
+    Added,
+    Deleted,
+    Renamed,
+    Untracked,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiffLine {
+    pub kind: DiffLineKind,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffLineKind {
+    Context,
+    Added,
+    Removed,
+    Header,
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +94,7 @@ impl CodePanel {
             .unwrap_or_else(|_| ".".to_string());
 
         let mut panel = Self {
+            mode: EditorMode::Files,
             cwd: cwd.clone(),
             entries: Vec::new(),
             selected_idx: 0,
@@ -45,6 +102,16 @@ impl CodePanel {
             file_path: None,
             buffer: TextBuffer::new(),
             open_buffers: HashMap::new(),
+            scm: ScmState {
+                entries: Vec::new(),
+                selected_idx: 0,
+                diff_lines: Vec::new(),
+                diff_scroll: 0,
+                branch: String::new(),
+                staged: 0,
+                unstaged: 0,
+                untracked: 0,
+            },
             viewport_height: 24,
         };
         panel.refresh_entries();
@@ -197,6 +264,236 @@ impl CodePanel {
             }
         } else {
             format!("{}{}:{}", prefix, path, self.buffer.cursor_row + 1)
+        }
+    }
+
+    // ─── Source Control ───
+
+    pub fn toggle_mode(&mut self) {
+        match self.mode {
+            EditorMode::Files => {
+                self.mode = EditorMode::SourceControl;
+                self.refresh_scm();
+            }
+            EditorMode::SourceControl => {
+                self.mode = EditorMode::Files;
+            }
+        }
+    }
+
+    pub fn refresh_scm(&mut self) {
+        self.scm.entries.clear();
+        self.scm.staged = 0;
+        self.scm.unstaged = 0;
+        self.scm.untracked = 0;
+
+        // Get branch
+        if let Ok(output) = std::process::Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(&self.cwd)
+            .output()
+        {
+            self.scm.branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        }
+
+        // Get status (porcelain v1 for easy parsing)
+        if let Ok(output) = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&self.cwd)
+            .output()
+        {
+            let status_str = String::from_utf8_lossy(&output.stdout);
+            for line in status_str.lines() {
+                if line.len() < 4 {
+                    continue;
+                }
+                let index_status = line.as_bytes()[0];
+                let worktree_status = line.as_bytes()[1];
+                let path = line[3..].to_string();
+
+                let (status, staged) = match (index_status, worktree_status) {
+                    (b'?', b'?') => {
+                        self.scm.untracked += 1;
+                        (ScmStatus::Untracked, false)
+                    }
+                    (b'A', _) => {
+                        self.scm.staged += 1;
+                        (ScmStatus::Added, true)
+                    }
+                    (b'D', _) => {
+                        self.scm.staged += 1;
+                        (ScmStatus::Deleted, true)
+                    }
+                    (b'R', _) => {
+                        self.scm.staged += 1;
+                        (ScmStatus::Renamed, true)
+                    }
+                    (b'M', _) => {
+                        self.scm.staged += 1;
+                        (ScmStatus::Modified, true)
+                    }
+                    (_, b'M') => {
+                        self.scm.unstaged += 1;
+                        (ScmStatus::Modified, false)
+                    }
+                    (_, b'D') => {
+                        self.scm.unstaged += 1;
+                        (ScmStatus::Deleted, false)
+                    }
+                    _ => {
+                        self.scm.unstaged += 1;
+                        (ScmStatus::Modified, false)
+                    }
+                };
+
+                self.scm.entries.push(ScmEntry {
+                    path,
+                    status,
+                    staged,
+                });
+            }
+        }
+
+        self.scm.selected_idx = 0;
+        if !self.scm.entries.is_empty() {
+            self.load_diff_for_selected();
+        }
+    }
+
+    fn load_diff_for_selected(&mut self) {
+        self.scm.diff_lines.clear();
+        self.scm.diff_scroll = 0;
+
+        if let Some(entry) = self.scm.entries.get(self.scm.selected_idx) {
+            let path = entry.path.clone();
+            let staged = entry.staged;
+
+            let args = if staged {
+                vec!["diff", "--cached", "--", &path]
+            } else {
+                vec!["diff", "--", &path]
+            };
+
+            if let Ok(output) = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&self.cwd)
+                .output()
+            {
+                let diff_str = String::from_utf8_lossy(&output.stdout);
+                for line in diff_str.lines() {
+                    let kind = if line.starts_with('+') && !line.starts_with("+++") {
+                        DiffLineKind::Added
+                    } else if line.starts_with('-') && !line.starts_with("---") {
+                        DiffLineKind::Removed
+                    } else if line.starts_with("@@")
+                        || line.starts_with("diff ")
+                        || line.starts_with("index ")
+                        || line.starts_with("---")
+                        || line.starts_with("+++")
+                    {
+                        DiffLineKind::Header
+                    } else {
+                        DiffLineKind::Context
+                    };
+                    self.scm.diff_lines.push(DiffLine {
+                        kind,
+                        text: line.to_string(),
+                    });
+                }
+            }
+
+            // For untracked files, show the whole file content as "added"
+            if self.scm.diff_lines.is_empty() {
+                if let Some(entry) = self.scm.entries.get(self.scm.selected_idx) {
+                    if entry.status == ScmStatus::Untracked {
+                        let full_path = format!("{}/{}", self.cwd, entry.path);
+                        if let Ok(content) = std::fs::read_to_string(&full_path) {
+                            self.scm.diff_lines.push(DiffLine {
+                                kind: DiffLineKind::Header,
+                                text: format!("New file: {}", entry.path),
+                            });
+                            for line in content.lines() {
+                                self.scm.diff_lines.push(DiffLine {
+                                    kind: DiffLineKind::Added,
+                                    text: format!("+{}", line),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn handle_scm_explorer_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.scm.selected_idx > 0 {
+                    self.scm.selected_idx -= 1;
+                    self.load_diff_for_selected();
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.scm.selected_idx + 1 < self.scm.entries.len() {
+                    self.scm.selected_idx += 1;
+                    self.load_diff_for_selected();
+                }
+            }
+            KeyCode::Enter => {
+                // Open the file in the editor
+                if let Some(entry) = self.scm.entries.get(self.scm.selected_idx) {
+                    let full_path = format!("{}/{}", self.cwd, entry.path);
+                    self.open_file(&full_path);
+                    self.mode = EditorMode::Files;
+                }
+            }
+            // 's' to stage, 'u' to unstage
+            KeyCode::Char('s') => {
+                if let Some(entry) = self.scm.entries.get(self.scm.selected_idx) {
+                    let path = entry.path.clone();
+                    let _ = std::process::Command::new("git")
+                        .args(["add", "--", &path])
+                        .current_dir(&self.cwd)
+                        .output();
+                    self.refresh_scm();
+                }
+            }
+            KeyCode::Char('u') => {
+                if let Some(entry) = self.scm.entries.get(self.scm.selected_idx) {
+                    let path = entry.path.clone();
+                    let _ = std::process::Command::new("git")
+                        .args(["reset", "HEAD", "--", &path])
+                        .current_dir(&self.cwd)
+                        .output();
+                    self.refresh_scm();
+                }
+            }
+            // 'r' to refresh
+            KeyCode::Char('r') => {
+                self.refresh_scm();
+            }
+            _ => {}
+        }
+    }
+
+    pub fn handle_scm_diff_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.scm.diff_scroll = self.scm.diff_scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.scm.diff_scroll + 1 < self.scm.diff_lines.len() {
+                    self.scm.diff_scroll += 1;
+                }
+            }
+            KeyCode::PageUp => {
+                self.scm.diff_scroll = self.scm.diff_scroll.saturating_sub(20);
+            }
+            KeyCode::PageDown => {
+                self.scm.diff_scroll = (self.scm.diff_scroll + 20)
+                    .min(self.scm.diff_lines.len().saturating_sub(1));
+            }
+            _ => {}
         }
     }
 
