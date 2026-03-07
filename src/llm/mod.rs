@@ -97,12 +97,24 @@ impl LlmManager {
     }
 
     /// Send a message to an existing agent (or create a default one)
+    #[allow(dead_code)]
     pub fn send_prompt(&mut self, prompt: &str) -> AgentId {
-        self.send_prompt_to(None, prompt)
+        self.send_prompt_with_history(prompt, &[])
+    }
+
+    /// Send a prompt with conversation history for context
+    pub fn send_prompt_with_history(&mut self, prompt: &str, history: &[(String, String)]) -> AgentId {
+        self.send_prompt_to_with_history(None, prompt, history)
     }
 
     /// Send a prompt to a specific agent, or create a new default one
+    #[allow(dead_code)]
     pub fn send_prompt_to(&mut self, agent_id: Option<&str>, prompt: &str) -> AgentId {
+        self.send_prompt_to_with_history(agent_id, prompt, &[])
+    }
+
+    /// Send a prompt to a specific agent with conversation history
+    pub fn send_prompt_to_with_history(&mut self, agent_id: Option<&str>, prompt: &str, history: &[(String, String)]) -> AgentId {
         let id = if let Some(id) = agent_id {
             id.to_string()
         } else if let Some(existing) = self.agents.values().find(|a| a.status == AgentStatus::Running || a.status == AgentStatus::Done) {
@@ -117,6 +129,7 @@ impl LlmManager {
         let cwd = self.cwd.clone();
         let model = self.agents.get(&id).map(|a| a.model.clone()).unwrap_or_else(|| self.default_model.clone());
         let max_tokens = self.default_max_tokens;
+        let history = history.to_vec();
 
         if api_key.is_empty() {
             let _ = tx.send((
@@ -142,6 +155,14 @@ impl LlmManager {
             };
             let mut agent = Agent::new(config, &cwd);
             agent.id = agent_id;
+
+            // Pre-populate conversation history from storage
+            for (role, content) in &history {
+                agent.history.push(agent::Message {
+                    role: role.clone(),
+                    content: agent::MessageContent::Text(content.clone()),
+                });
+            }
 
             let tools = ToolRegistry::with_defaults();
             agent.run(&prompt, &api_key, &tools, &tx).await;

@@ -423,9 +423,7 @@ fn draw_prompt_panel(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
             draw_text_buffer(f, &mut app.prompt_panel.compose, compose_area, focused, false);
         }
         PromptView::History => {
-            let msg = Paragraph::new("Thread history will appear here.\nPress Esc to go back.")
-                .style(Style::default().fg(Color::DarkGray));
-            f.render_widget(msg, inner);
+            draw_prompt_history(f, app, inner);
         }
     }
 }
@@ -491,6 +489,62 @@ fn draw_prompt_browser(f: &mut Frame, app: &App, area: Rect) {
             area,
         );
     }
+}
+
+// ─── Prompt History ───
+
+fn draw_prompt_history(f: &mut Frame, app: &App, area: Rect) {
+    let messages = &app.prompt_panel.history_messages;
+
+    if messages.is_empty() {
+        f.render_widget(
+            Paragraph::new("No messages yet.\nPress Esc to go back.")
+                .style(Style::default().fg(Color::DarkGray)),
+            area,
+        );
+        return;
+    }
+
+    let height = area.height as usize;
+    let mut all_lines: Vec<Line> = Vec::new();
+
+    for msg in messages {
+        let (role_label, role_color) = match msg.role.as_str() {
+            "user" => ("You", Color::Cyan),
+            "assistant" => ("Assistant", Color::Green),
+            _ => (&*msg.role, Color::DarkGray),
+        };
+
+        // Role header
+        all_lines.push(Line::from(Span::styled(
+            format!("── {} ──", role_label),
+            Style::default().fg(role_color).add_modifier(Modifier::BOLD),
+        )));
+
+        // Message content (truncate long messages in history view)
+        let content = if msg.content.len() > 2000 {
+            format!("{}…", &msg.content[..2000])
+        } else {
+            msg.content.clone()
+        };
+        for line in content.lines() {
+            all_lines.push(Line::from(Span::styled(
+                line.to_string(),
+                Style::default().fg(Color::White),
+            )));
+        }
+        all_lines.push(Line::from("")); // blank separator
+    }
+
+    let scroll = app.prompt_panel.history_scroll;
+    // Scroll from the bottom (most recent messages)
+    let total = all_lines.len();
+    let end = total.saturating_sub(scroll);
+    let start = end.saturating_sub(height);
+
+    let visible: Vec<Line> = all_lines[start..end].to_vec();
+
+    f.render_widget(Paragraph::new(visible), area);
 }
 
 // ─── Helpers ───

@@ -24,6 +24,8 @@ pub struct LlmPanel {
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub streaming: bool,
+    /// Raw assistant response text for current turn (saved to storage on Done)
+    pub pending_response: String,
 }
 
 impl LlmPanel {
@@ -37,6 +39,7 @@ impl LlmPanel {
             tokens_in: 0,
             tokens_out: 0,
             streaming: false,
+            pending_response: String::new(),
         }
     }
 
@@ -44,6 +47,7 @@ impl LlmPanel {
         match chunk {
             LlmChunk::Text(text) => {
                 self.streaming = true;
+                self.pending_response.push_str(&text);
                 for ch in text.chars() {
                     if ch == '\n' {
                         self.lines.push(std::mem::take(&mut self.current_line));
@@ -79,10 +83,12 @@ impl LlmPanel {
                 self.tokens_in += tokens_in;
                 self.tokens_out += tokens_out;
                 self.streaming = false;
+                // pending_response is consumed by App::poll_llm_updates to save to storage
             }
             LlmChunk::Error(msg) => {
                 self.lines.push(format!("[ERROR] {}", msg));
                 self.streaming = false;
+                self.pending_response.clear();
             }
         }
     }

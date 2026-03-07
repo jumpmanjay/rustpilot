@@ -71,13 +71,17 @@ impl App {
         let store = Store::new(&config)?;
         let llm = LlmManager::new(&config);
 
+        let mut prompt_panel = PromptPanel::new();
+        // Load projects from storage on startup
+        prompt_panel.projects = store.list_projects().unwrap_or_default();
+
         Ok(Self {
             config,
             store,
             llm,
             code_panel: CodePanel::new(),
             llm_panel: LlmPanel::new(),
-            prompt_panel: PromptPanel::new(),
+            prompt_panel,
             focused: PanelId::Editor,
             visible: [true, true, true, true],
             should_quit: false,
@@ -138,7 +142,16 @@ impl App {
     }
 
     pub fn poll_llm_updates(&mut self) {
+        let was_streaming = self.llm_panel.streaming;
         self.llm.poll_updates(&mut self.llm_panel);
+
+        // When streaming just finished, save the assistant response to storage
+        if was_streaming && !self.llm_panel.streaming && !self.llm_panel.pending_response.is_empty() {
+            if let (Some(proj), Some(thread)) = (&self.prompt_panel.current_project, &self.prompt_panel.current_thread) {
+                let _ = self.store.append_message(proj, thread, "assistant", &self.llm_panel.pending_response);
+            }
+            self.llm_panel.pending_response.clear();
+        }
     }
 
     pub fn unsaved_files(&self) -> Vec<String> {

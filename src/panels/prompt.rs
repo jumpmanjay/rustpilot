@@ -2,7 +2,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::editor::TextBuffer;
 use crate::llm::LlmManager;
-use crate::storage::Store;
+use crate::storage::{Store, Message as StorageMessage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptView {
@@ -37,6 +37,7 @@ pub struct PromptPanel {
     pub changed_files: Vec<String>,
 
     // History view
+    pub history_messages: Vec<StorageMessage>,
     pub history_scroll: usize,
 
     // Viewport size (set during render)
@@ -56,6 +57,7 @@ impl PromptPanel {
             compose: TextBuffer::new(),
             pending_references: Vec::new(),
             changed_files: Vec::new(),
+            history_messages: Vec::new(),
             history_scroll: 0,
             viewport_height: 24,
         }
@@ -177,7 +179,16 @@ impl PromptPanel {
 
                         let resolved = crate::refs::resolve_references(&full_prompt);
                         let _ = store.append_message(proj, thread, "user", &full_prompt);
-                        let _ = llm.send_prompt(&resolved);
+
+                        // Load conversation history for context
+                        let history = store.read_thread(proj, thread).unwrap_or_default();
+                        // Convert to (role, content) pairs, excluding the message we just appended
+                        let context: Vec<(String, String)> = history.iter()
+                            .rev().skip(1).rev() // all but last (the one we just added)
+                            .map(|m| (m.role.clone(), m.content.clone()))
+                            .collect();
+
+                        let _ = llm.send_prompt_with_history(&resolved, &context);
                         self.compose.clear();
                         self.clear_changed_files();
                     }
@@ -191,6 +202,9 @@ impl PromptPanel {
             }
             // View history: Ctrl+H
             KeyCode::Char('h') if ctrl => {
+                if let (Some(proj), Some(thread)) = (&self.current_project, &self.current_thread) {
+                    self.history_messages = store.read_thread(proj, thread).unwrap_or_default();
+                }
                 self.view = PromptView::History;
                 self.history_scroll = 0;
                 return;
