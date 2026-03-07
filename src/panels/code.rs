@@ -1,4 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::collections::HashMap;
 
 use super::editor::TextBuffer;
 use super::prompt::PromptPanel;
@@ -13,6 +14,9 @@ pub struct CodePanel {
     // Editor state
     pub file_path: Option<String>,
     pub buffer: TextBuffer,
+
+    // Open file buffers — preserves unsaved changes when switching files
+    pub open_buffers: HashMap<String, TextBuffer>,
 
     // Viewport size (set during render)
     pub viewport_height: usize,
@@ -40,6 +44,7 @@ impl CodePanel {
             tree_scroll: 0,
             file_path: None,
             buffer: TextBuffer::new(),
+            open_buffers: HashMap::new(),
             viewport_height: 24,
         };
         panel.refresh_entries();
@@ -88,7 +93,18 @@ impl CodePanel {
     }
 
     pub fn open_file(&mut self, path: &str) {
-        if let Ok(content) = std::fs::read_to_string(path) {
+        // Stash current buffer if we have a file open
+        if let Some(ref current_path) = self.file_path {
+            let current_path = current_path.clone();
+            let current_buf = std::mem::replace(&mut self.buffer, TextBuffer::new());
+            self.open_buffers.insert(current_path, current_buf);
+        }
+
+        // Check if we already have this file open (with unsaved changes)
+        if let Some(buf) = self.open_buffers.remove(path) {
+            self.file_path = Some(path.to_string());
+            self.buffer = buf;
+        } else if let Ok(content) = std::fs::read_to_string(path) {
             self.file_path = Some(path.to_string());
             self.buffer = TextBuffer::from_string(&content);
         }
@@ -187,6 +203,8 @@ impl CodePanel {
             let content = self.buffer.to_string();
             if std::fs::write(path, &content).is_ok() {
                 self.buffer.modified = false;
+                // Remove from open_buffers cache since it's now saved
+                self.open_buffers.remove(path);
             }
         }
     }
