@@ -1,5 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use super::editor::TextBuffer;
 use crate::llm::LlmManager;
 use crate::storage::Store;
 
@@ -26,16 +27,17 @@ pub struct PromptPanel {
     pub current_project: Option<String>,
     pub current_thread: Option<String>,
 
-    // Compose state
-    pub compose_lines: Vec<String>,
-    pub compose_cursor_row: usize,
-    pub compose_cursor_col: usize,
+    // Compose state — now using TextBuffer
+    pub compose: TextBuffer,
 
     // References queued from other panels
     pub pending_references: Vec<String>,
 
     // History view
     pub history_scroll: usize,
+
+    // Viewport size (set during render)
+    pub viewport_height: usize,
 }
 
 impl PromptPanel {
@@ -48,21 +50,17 @@ impl PromptPanel {
             selected_thread: 0,
             current_project: None,
             current_thread: None,
-            compose_lines: vec![String::new()],
-            compose_cursor_row: 0,
-            compose_cursor_col: 0,
+            compose: TextBuffer::new(),
             pending_references: Vec::new(),
             history_scroll: 0,
+            viewport_height: 24,
         }
     }
 
     /// Insert a reference from another panel (file path, line ref, etc.)
     pub fn insert_reference(&mut self, reference: &str, _is_include: bool) {
-        // If composing, insert at cursor. Otherwise queue it.
         if self.view == PromptView::Compose {
-            let row = self.compose_cursor_row;
-            self.compose_lines[row].insert_str(self.compose_cursor_col, reference);
-            self.compose_cursor_col += reference.len();
+            self.compose.insert_str(reference);
         } else {
             self.pending_references.push(reference.to_string());
         }
@@ -80,15 +78,11 @@ impl PromptPanel {
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.current_project.is_some() {
-                    // Navigating threads
                     if self.selected_thread > 0 {
                         self.selected_thread -= 1;
                     }
-                } else {
-                    // Navigating projects
-                    if self.selected_project > 0 {
-                        self.selected_project -= 1;
-                    }
+                } else if self.selected_project > 0 {
+                    self.selected_project -= 1;
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
@@ -102,42 +96,34 @@ impl PromptPanel {
             }
             KeyCode::Enter => {
                 if self.current_project.is_none() {
-                    // Select project
                     if let Some(proj) = self.projects.get(self.selected_project).cloned() {
                         self.current_project = Some(proj.clone());
                         self.threads = store.list_threads(&proj).unwrap_or_default();
                         self.selected_thread = 0;
                     }
                 } else {
-                    // Select thread → go to compose
                     if let Some(thread) = self.threads.get(self.selected_thread).cloned() {
                         self.current_thread = Some(thread);
                         self.view = PromptView::Compose;
-                        self.compose_lines = vec![String::new()];
-                        self.compose_cursor_row = 0;
-                        self.compose_cursor_col = 0;
+                        self.compose.clear();
 
                         // Insert any pending references
                         for r in self.pending_references.drain(..) {
-                            self.compose_lines[0].push_str(&r);
-                            self.compose_lines[0].push(' ');
+                            self.compose.insert_str(&r);
+                            self.compose.insert_char(' ');
                         }
-                        self.compose_cursor_col = self.compose_lines[0].len();
                     }
                 }
             }
             KeyCode::Backspace => {
-                // Go back from threads to projects
                 if self.current_project.is_some() {
                     self.current_project = None;
                     self.current_thread = None;
                     self.selected_thread = 0;
                 }
             }
-            // Ctrl+N: new project/thread
             KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.current_project.is_none() {
-                    // TODO: prompt for project name (inline input)
                     let name = format!("project-{}", self.projects.len() + 1);
                     let _ = store.create_project(&name);
                     self.projects = store.list_projects().unwrap_or_default();
@@ -152,84 +138,40 @@ impl PromptPanel {
     }
 
     fn handle_compose_key(&mut self, key: KeyEvent, llm: &mut LlmManager, store: &mut Store) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
         match key.code {
             // Send prompt: Ctrl+Enter
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let prompt_text = self.compose_lines.join("\n");
+            KeyCode::Enter if ctrl => {
+                let prompt_text = self.compose.to_string();
                 if !prompt_text.trim().is_empty() {
                     if let (Some(proj), Some(thread)) =
                         (&self.current_project, &self.current_thread)
                     {
-                        // Resolve references and store
                         let resolved = crate::refs::resolve_references(&prompt_text);
                         let _ = store.append_message(proj, thread, "user", &prompt_text);
-
-                        // Send to LLM
                         llm.send_prompt(&resolved);
-
-                        // Clear compose
-                        self.compose_lines = vec![String::new()];
-                        self.compose_cursor_row = 0;
-                        self.compose_cursor_col = 0;
+                        self.compose.clear();
                     }
                 }
+                return;
             }
-
             // Back to browser: Escape
             KeyCode::Esc => {
                 self.view = PromptView::Browser;
+                return;
             }
-
             // View history: Ctrl+H
-            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('h') if ctrl => {
                 self.view = PromptView::History;
                 self.history_scroll = 0;
-            }
-
-            // Basic text editing
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.compose_lines[self.compose_cursor_row].insert(self.compose_cursor_col, c);
-                self.compose_cursor_col += 1;
-            }
-            KeyCode::Backspace if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.compose_cursor_col > 0 {
-                    self.compose_lines[self.compose_cursor_row]
-                        .remove(self.compose_cursor_col - 1);
-                    self.compose_cursor_col -= 1;
-                } else if self.compose_cursor_row > 0 {
-                    let line = self.compose_lines.remove(self.compose_cursor_row);
-                    self.compose_cursor_row -= 1;
-                    self.compose_cursor_col = self.compose_lines[self.compose_cursor_row].len();
-                    self.compose_lines[self.compose_cursor_row].push_str(&line);
-                }
-            }
-            KeyCode::Enter => {
-                let rest = self.compose_lines[self.compose_cursor_row]
-                    .split_off(self.compose_cursor_col);
-                self.compose_cursor_row += 1;
-                self.compose_lines.insert(self.compose_cursor_row, rest);
-                self.compose_cursor_col = 0;
-            }
-            KeyCode::Up => {
-                if self.compose_cursor_row > 0 {
-                    self.compose_cursor_row -= 1;
-                    let len = self.compose_lines[self.compose_cursor_row].len();
-                    if self.compose_cursor_col > len {
-                        self.compose_cursor_col = len;
-                    }
-                }
-            }
-            KeyCode::Down => {
-                if self.compose_cursor_row + 1 < self.compose_lines.len() {
-                    self.compose_cursor_row += 1;
-                    let len = self.compose_lines[self.compose_cursor_row].len();
-                    if self.compose_cursor_col > len {
-                        self.compose_cursor_col = len;
-                    }
-                }
+                return;
             }
             _ => {}
         }
+
+        // Delegate to TextBuffer for all editing
+        self.compose.handle_key(key, self.viewport_height);
     }
 
     fn handle_history_key(&mut self, key: KeyEvent) {

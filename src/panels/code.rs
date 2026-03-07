@@ -1,5 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use super::editor::TextBuffer;
 use super::prompt::PromptPanel;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,14 +21,10 @@ pub struct CodePanel {
 
     // Editor state
     pub file_path: Option<String>,
-    pub lines: Vec<String>,
-    pub cursor_row: usize,
-    pub cursor_col: usize,
-    pub scroll_offset: usize,
-    pub modified: bool,
+    pub buffer: TextBuffer,
 
-    // Line selection for references
-    pub select_anchor: Option<usize>,
+    // Viewport size (set during render)
+    pub viewport_height: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -52,12 +49,8 @@ impl CodePanel {
             selected_idx: 0,
             tree_scroll: 0,
             file_path: None,
-            lines: Vec::new(),
-            cursor_row: 0,
-            cursor_col: 0,
-            scroll_offset: 0,
-            modified: false,
-            select_anchor: None,
+            buffer: TextBuffer::new(),
+            viewport_height: 24,
         };
         panel.refresh_entries();
         panel
@@ -92,15 +85,7 @@ impl CodePanel {
     pub fn open_file(&mut self, path: &str) {
         if let Ok(content) = std::fs::read_to_string(path) {
             self.file_path = Some(path.to_string());
-            self.lines = content.lines().map(|l| l.to_string()).collect();
-            if self.lines.is_empty() {
-                self.lines.push(String::new());
-            }
-            self.cursor_row = 0;
-            self.cursor_col = 0;
-            self.scroll_offset = 0;
-            self.modified = false;
-            self.select_anchor = None;
+            self.buffer = TextBuffer::from_string(&content);
             self.view = CodeView::Editor;
         }
     }
@@ -136,7 +121,6 @@ impl CodePanel {
                 }
             }
             KeyCode::Backspace => {
-                // Go up one directory
                 if let Some(parent) = std::path::Path::new(&self.cwd).parent() {
                     self.cwd = parent.to_string_lossy().to_string();
                     self.selected_idx = 0;
@@ -160,161 +144,62 @@ impl CodePanel {
     }
 
     fn handle_editor_key(&mut self, key: KeyEvent, prompt: &mut PromptPanel) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        // Editor-specific keybinds (before passing to TextBuffer)
         match key.code {
-            // Navigation
-            KeyCode::Up => {
-                if self.cursor_row > 0 {
-                    self.cursor_row -= 1;
-                    self.clamp_cursor_col();
-                }
-            }
-            KeyCode::Down => {
-                if self.cursor_row + 1 < self.lines.len() {
-                    self.cursor_row += 1;
-                    self.clamp_cursor_col();
-                }
-            }
-            KeyCode::Left => {
-                if self.cursor_col > 0 {
-                    self.cursor_col -= 1;
-                }
-            }
-            KeyCode::Right => {
-                let line_len = self.lines[self.cursor_row].len();
-                if self.cursor_col < line_len {
-                    self.cursor_col += 1;
-                }
-            }
-            KeyCode::Home => self.cursor_col = 0,
-            KeyCode::End => self.cursor_col = self.lines[self.cursor_row].len(),
-
             // Save: Ctrl+S
-            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('s') if ctrl => {
                 self.save_file();
+                return;
             }
-
             // Back to explorer: Ctrl+E
-            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('e') if ctrl => {
                 self.view = CodeView::Explorer;
+                return;
             }
-
             // Send tag reference: Ctrl+R
-            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('r') if ctrl => {
                 if let Some(ref path) = self.file_path {
-                    let line_ref = if let Some(anchor) = self.select_anchor {
-                        let (start, end) = if anchor <= self.cursor_row {
-                            (anchor + 1, self.cursor_row + 1)
-                        } else {
-                            (self.cursor_row + 1, anchor + 1)
-                        };
-                        if start == end {
-                            format!("@{}:{}", path, start)
-                        } else {
-                            format!("@{}:{}-{}", path, start, end)
-                        }
-                    } else {
-                        format!("@{}:{}", path, self.cursor_row + 1)
-                    };
+                    let line_ref = self.make_line_ref(path, "@");
                     prompt.insert_reference(&line_ref, false);
                 }
+                return;
             }
-
             // Send include reference: Ctrl+Shift+R
-            KeyCode::Char('R') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('R') if ctrl => {
                 if let Some(ref path) = self.file_path {
-                    let line_ref = if let Some(anchor) = self.select_anchor {
-                        let (start, end) = if anchor <= self.cursor_row {
-                            (anchor + 1, self.cursor_row + 1)
-                        } else {
-                            (self.cursor_row + 1, anchor + 1)
-                        };
-                        if start == end {
-                            format!("@@{}:{}", path, start)
-                        } else {
-                            format!("@@{}:{}-{}", path, start, end)
-                        }
-                    } else {
-                        format!("@@{}:{}", path, self.cursor_row + 1)
-                    };
+                    let line_ref = self.make_line_ref(path, "@@");
                     prompt.insert_reference(&line_ref, true);
                 }
-            }
-
-            // Toggle line selection anchor: Ctrl+L
-            KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.select_anchor.is_some() {
-                    self.select_anchor = None;
-                } else {
-                    self.select_anchor = Some(self.cursor_row);
-                }
-            }
-
-            // Basic text editing
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let row = self.cursor_row;
-                self.lines[row].insert(self.cursor_col, c);
-                self.cursor_col += 1;
-                self.modified = true;
-            }
-            KeyCode::Backspace if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.cursor_col > 0 {
-                    self.lines[self.cursor_row].remove(self.cursor_col - 1);
-                    self.cursor_col -= 1;
-                    self.modified = true;
-                } else if self.cursor_row > 0 {
-                    let line = self.lines.remove(self.cursor_row);
-                    self.cursor_row -= 1;
-                    self.cursor_col = self.lines[self.cursor_row].len();
-                    self.lines[self.cursor_row].push_str(&line);
-                    self.modified = true;
-                }
-            }
-            KeyCode::Enter if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let rest = self.lines[self.cursor_row].split_off(self.cursor_col);
-                self.cursor_row += 1;
-                self.lines.insert(self.cursor_row, rest);
-                self.cursor_col = 0;
-                self.modified = true;
+                return;
             }
             _ => {}
         }
 
-        // Keep cursor in viewport
-        self.adjust_scroll();
+        // Delegate to TextBuffer
+        self.buffer.handle_key(key, self.viewport_height);
     }
 
-    fn clamp_cursor_col(&mut self) {
-        let line_len = self.lines[self.cursor_row].len();
-        if self.cursor_col > line_len {
-            self.cursor_col = line_len;
-        }
-    }
-
-    fn adjust_scroll(&mut self) {
-        // Will be called with actual viewport height during render
-        // For now, basic logic
-        if self.cursor_row < self.scroll_offset {
-            self.scroll_offset = self.cursor_row;
-        }
-    }
-
-    pub fn adjust_scroll_for_height(&mut self, height: usize) {
-        if height == 0 {
-            return;
-        }
-        if self.cursor_row < self.scroll_offset {
-            self.scroll_offset = self.cursor_row;
-        }
-        if self.cursor_row >= self.scroll_offset + height {
-            self.scroll_offset = self.cursor_row - height + 1;
+    fn make_line_ref(&self, path: &str, prefix: &str) -> String {
+        if let Some((sr, _, er, _)) = self.buffer.selection_range() {
+            let start = sr + 1;
+            let end = er + 1;
+            if start == end {
+                format!("{}{}:{}", prefix, path, start)
+            } else {
+                format!("{}{}:{}-{}", prefix, path, start, end)
+            }
+        } else {
+            format!("{}{}:{}", prefix, path, self.buffer.cursor_row + 1)
         }
     }
 
     fn save_file(&mut self) {
         if let Some(ref path) = self.file_path {
-            let content = self.lines.join("\n");
+            let content = self.buffer.to_string();
             if std::fs::write(path, &content).is_ok() {
-                self.modified = false;
+                self.buffer.modified = false;
             }
         }
     }

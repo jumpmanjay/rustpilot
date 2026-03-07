@@ -56,20 +56,30 @@ async fn run_app(
         // Poll for events with a small timeout so we can check async channels
         if event::poll(std::time::Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
-                // Global quit: Ctrl+Q
+                // Global quit: Ctrl+Q (with confirmation)
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     && key.code == KeyCode::Char('q')
                 {
-                    return Ok(());
+                    if app.quit_confirm {
+                        return Ok(());
+                    } else {
+                        app.quit_confirm = true;
+                        continue;
+                    }
                 }
 
-                // Global panel toggles: Ctrl+1/2/3
-                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                // Any other key cancels quit confirmation
+                if app.quit_confirm {
+                    app.quit_confirm = false;
+                }
+
+                // Global: Alt+F1/F2/F3 toggle panels, Alt+` cycle focus
+                if key.modifiers.contains(KeyModifiers::ALT) {
                     match key.code {
-                        KeyCode::Char('1') => app.toggle_panel(panels::PanelId::Code),
-                        KeyCode::Char('2') => app.toggle_panel(panels::PanelId::Llm),
-                        KeyCode::Char('3') => app.toggle_panel(panels::PanelId::Prompt),
-                        KeyCode::Char('`') => app.cycle_focus(),
+                        KeyCode::F(1) => { app.toggle_panel(panels::PanelId::Code); continue; }
+                        KeyCode::F(2) => { app.toggle_panel(panels::PanelId::Llm); continue; }
+                        KeyCode::F(3) => { app.toggle_panel(panels::PanelId::Prompt); continue; }
+                        KeyCode::Char('`') => { app.cycle_focus(); continue; }
                         _ => {}
                     }
                 }

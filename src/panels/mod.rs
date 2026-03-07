@@ -1,4 +1,5 @@
 pub mod code;
+pub mod editor;
 pub mod llm;
 pub mod prompt;
 

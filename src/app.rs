@@ -25,6 +25,7 @@ pub struct App {
     pub layout: [PanelId; 3],
 
     pub should_quit: bool,
+    pub quit_confirm: bool,
 }
 
 impl App {
@@ -44,6 +45,7 @@ impl App {
             visible: [true, true, true],
             layout: [PanelId::Code, PanelId::Llm, PanelId::Prompt],
             should_quit: false,
+            quit_confirm: false,
         })
     }
 

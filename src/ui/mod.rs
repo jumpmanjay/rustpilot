@@ -1,26 +1,49 @@
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Frame,
 };
 
 use crate::app::App;
 use crate::panels::code::CodeView;
+use crate::panels::editor::TextBuffer;
 use crate::panels::prompt::PromptView;
 use crate::panels::PanelId;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
+    // Quit confirmation overlay
+    if app.quit_confirm {
+        let area = f.area();
+        let msg = Paragraph::new(
+            "Quit RustPilot? Press Ctrl+Q again to confirm, any other key to cancel.",
+        )
+        .style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: false });
+        let center = Rect::new(area.x + area.width / 4, area.y + area.height / 2 - 1, area.width / 2, 3);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Red))
+            .title(" Quit? ");
+        f.render_widget(Clear, center);
+        f.render_widget(msg.block(block), center);
+        return;
+    }
+
     let visible = app.visible_panels();
     if visible.is_empty() {
-        let msg = Paragraph::new("No panels visible. Press Ctrl+1/2/3 to show a panel.")
+        let msg = Paragraph::new("No panels visible. Press Alt+F1/F2/F3 to show a panel.")
             .style(Style::default().fg(Color::DarkGray));
         f.render_widget(msg, f.area());
         return;
     }
 
-    // Split area based on visible panel count
     let constraints: Vec<Constraint> = visible
         .iter()
         .map(|_| Constraint::Percentage(100 / visible.len() as u16))
@@ -51,35 +74,70 @@ fn panel_border_style(focused: bool) -> Style {
     }
 }
 
+// ─── Code Panel ───
+
 fn draw_code_panel(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
+    let title = match app.code_panel.view {
+        CodeView::Explorer => format!(" Explorer: {} ", short_path(&app.code_panel.cwd)),
+        CodeView::Editor => {
+            let path = app
+                .code_panel
+                .file_path
+                .as_deref()
+                .unwrap_or("untitled");
+            let modified = if app.code_panel.buffer.modified {
+                " [+]"
+            } else {
+                ""
+            };
+            let pos = format!(
+                " Ln {}, Col {} ",
+                app.code_panel.buffer.cursor_row + 1,
+                app.code_panel.buffer.cursor_col + 1
+            );
+            format!(" {}{} —{}", short_path(path), modified, pos)
+        }
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(panel_border_style(focused))
-        .title(match app.code_panel.view {
-            CodeView::Explorer => " Explorer ",
-            CodeView::Editor => {
-                " Editor "
-            }
-        });
+        .title(title);
 
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     match app.code_panel.view {
         CodeView::Explorer => draw_explorer(f, app, inner),
-        CodeView::Editor => draw_editor(f, app, inner, focused),
+        CodeView::Editor => {
+            app.code_panel.viewport_height = inner.height as usize;
+            draw_text_buffer(f, &mut app.code_panel.buffer, inner, focused, true);
+        }
     }
 }
 
 fn draw_explorer(f: &mut Frame, app: &App, area: Rect) {
+    let height = area.height as usize;
+    let total = app.code_panel.entries.len();
+    let selected = app.code_panel.selected_idx;
+
+    // Scroll to keep selected visible
+    let scroll = if selected >= height {
+        selected - height + 1
+    } else {
+        0
+    };
+
     let items: Vec<ListItem> = app
         .code_panel
         .entries
         .iter()
         .enumerate()
+        .skip(scroll)
+        .take(height)
         .map(|(i, entry)| {
             let prefix = if entry.is_dir { "📁 " } else { "  " };
-            let style = if i == app.code_panel.selected_idx {
+            let style = if i == selected {
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD)
@@ -99,39 +157,73 @@ fn draw_explorer(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(list, area);
 }
 
-fn draw_editor(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
-    let height = area.height as usize;
-    app.code_panel.adjust_scroll_for_height(height);
+// ─── Shared TextBuffer rendering ───
 
-    let gutter_width = 4;
-    let start = app.code_panel.scroll_offset;
-    let end = (start + height).min(app.code_panel.lines.len());
+fn draw_text_buffer(
+    f: &mut Frame,
+    buf: &mut TextBuffer,
+    area: Rect,
+    focused: bool,
+    show_line_numbers: bool,
+) {
+    let height = area.height as usize;
+    let width = area.width as usize;
+    let gutter_width: usize = if show_line_numbers { 5 } else { 0 };
+
+    buf.adjust_scroll(height, width);
+
+    let start = buf.scroll_row;
+    let end = (start + height).min(buf.lines.len());
 
     let lines: Vec<Line> = (start..end)
         .map(|i| {
-            let line_num = format!("{:>3} ", i + 1);
-            let content = &app.code_panel.lines[i];
+            let content = &buf.lines[i];
 
-            let is_selected = app.code_panel.select_anchor.map_or(false, |anchor| {
-                let (lo, hi) = if anchor <= app.code_panel.cursor_row {
-                    (anchor, app.code_panel.cursor_row)
-                } else {
-                    (app.code_panel.cursor_row, anchor)
-                };
-                i >= lo && i <= hi
-            });
+            let mut spans = Vec::new();
 
-            let num_style = Style::default().fg(Color::DarkGray);
-            let content_style = if is_selected {
-                Style::default().bg(Color::DarkGray).fg(Color::White)
+            // Line number gutter
+            if show_line_numbers {
+                spans.push(Span::styled(
+                    format!("{:>4} ", i + 1),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+
+            // Content with selection highlighting
+            if let Some((sel_start, sel_end)) = buf.selection_cols_for_row(i) {
+                let before = &content[..sel_start.min(content.len())];
+                let selected = &content
+                    [sel_start.min(content.len())..sel_end.min(content.len())];
+                let after = &content[sel_end.min(content.len())..];
+
+                if !before.is_empty() {
+                    spans.push(Span::styled(
+                        before.to_string(),
+                        Style::default().fg(Color::White),
+                    ));
+                }
+                if !selected.is_empty() {
+                    spans.push(Span::styled(
+                        selected.to_string(),
+                        Style::default()
+                            .bg(Color::DarkGray)
+                            .fg(Color::White),
+                    ));
+                }
+                if !after.is_empty() {
+                    spans.push(Span::styled(
+                        after.to_string(),
+                        Style::default().fg(Color::White),
+                    ));
+                }
             } else {
-                Style::default().fg(Color::White)
-            };
+                spans.push(Span::styled(
+                    content.to_string(),
+                    Style::default().fg(Color::White),
+                ));
+            }
 
-            Line::from(vec![
-                Span::styled(line_num, num_style),
-                Span::styled(content.to_string(), content_style),
-            ])
+            Line::from(spans)
         })
         .collect();
 
@@ -140,13 +232,16 @@ fn draw_editor(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
 
     // Cursor
     if focused {
-        let cursor_y = area.y + (app.code_panel.cursor_row - app.code_panel.scroll_offset) as u16;
-        let cursor_x = area.x + gutter_width + app.code_panel.cursor_col as u16;
+        let cursor_y = area.y + (buf.cursor_row.saturating_sub(buf.scroll_row)) as u16;
+        let cursor_x =
+            area.x + gutter_width as u16 + (buf.cursor_col.saturating_sub(buf.scroll_col)) as u16;
         if cursor_y < area.y + area.height && cursor_x < area.x + area.width {
             f.set_cursor_position((cursor_x, cursor_y));
         }
     }
 }
+
+// ─── LLM Panel ───
 
 fn draw_llm_panel(f: &mut Frame, app: &App, area: Rect, focused: bool) {
     let panel = &app.llm_panel;
@@ -171,7 +266,6 @@ fn draw_llm_panel(f: &mut Frame, app: &App, area: Rect, focused: bool) {
     let height = inner.height as usize;
     let total = panel.total_lines();
 
-    // Calculate visible range (scroll from bottom)
     let end = total.saturating_sub(panel.scroll_offset);
     let start = end.saturating_sub(height);
 
@@ -192,6 +286,8 @@ fn draw_llm_panel(f: &mut Frame, app: &App, area: Rect, focused: bool) {
     f.render_widget(paragraph, inner);
 }
 
+// ─── Prompt Panel ───
+
 fn draw_prompt_panel(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
     let title = match app.prompt_panel.view {
         PromptView::Browser => " Prompts ",
@@ -209,7 +305,29 @@ fn draw_prompt_panel(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
 
     match app.prompt_panel.view {
         PromptView::Browser => draw_prompt_browser(f, app, inner),
-        PromptView::Compose => draw_prompt_compose(f, app, inner, focused),
+        PromptView::Compose => {
+            // Show pending refs header
+            let compose_area = if !app.prompt_panel.pending_references.is_empty() {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(2), Constraint::Min(1)])
+                    .split(inner);
+
+                let refs_text = format!(
+                    "📎 {} pending refs (Enter thread to insert)",
+                    app.prompt_panel.pending_references.len()
+                );
+                let refs_para = Paragraph::new(refs_text)
+                    .style(Style::default().fg(Color::Yellow));
+                f.render_widget(refs_para, chunks[0]);
+                chunks[1]
+            } else {
+                inner
+            };
+
+            app.prompt_panel.viewport_height = compose_area.height as usize;
+            draw_text_buffer(f, &mut app.prompt_panel.compose, compose_area, focused, false);
+        }
         PromptView::History => draw_prompt_history(f, app, inner),
     }
 }
@@ -218,7 +336,6 @@ fn draw_prompt_browser(f: &mut Frame, app: &App, area: Rect) {
     let panel = &app.prompt_panel;
 
     if panel.current_project.is_none() {
-        // Show projects
         let items: Vec<ListItem> = panel
             .projects
             .iter()
@@ -248,7 +365,6 @@ fn draw_prompt_browser(f: &mut Frame, app: &App, area: Rect) {
         );
         f.render_widget(list, area);
     } else {
-        // Show threads
         let items: Vec<ListItem> = panel
             .threads
             .iter()
@@ -266,7 +382,7 @@ fn draw_prompt_browser(f: &mut Frame, app: &App, area: Rect) {
             .collect();
 
         let header = format!(
-            "{} — Threads (Enter to open, Backspace to go back, Ctrl+N for new)",
+            "{} — Threads (Enter to open, Backspace back, Ctrl+N new)",
             panel.current_project.as_deref().unwrap_or("")
         );
 
@@ -279,45 +395,17 @@ fn draw_prompt_browser(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn draw_prompt_compose(f: &mut Frame, app: &App, area: Rect, focused: bool) {
-    let panel = &app.prompt_panel;
-
-    // Show pending references at top if any
-    let mut lines: Vec<Line> = Vec::new();
-
-    if !panel.pending_references.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!("📎 {} pending refs", panel.pending_references.len()),
-            Style::default().fg(Color::Yellow),
-        )));
-        lines.push(Line::from(""));
-    }
-
-    for (i, line) in panel.compose_lines.iter().enumerate() {
-        let style = Style::default().fg(Color::White);
-        lines.push(Line::from(Span::styled(line.to_string(), style)));
-    }
-
-    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-    f.render_widget(paragraph, area);
-
-    // Cursor
-    if focused {
-        let offset_y = if panel.pending_references.is_empty() {
-            0
-        } else {
-            2
-        };
-        let cursor_y = area.y + offset_y + panel.compose_cursor_row as u16;
-        let cursor_x = area.x + panel.compose_cursor_col as u16;
-        if cursor_y < area.y + area.height && cursor_x < area.x + area.width {
-            f.set_cursor_position((cursor_x, cursor_y));
-        }
-    }
-}
-
 fn draw_prompt_history(f: &mut Frame, _app: &App, area: Rect) {
     let msg = Paragraph::new("Thread history will appear here.\nPress Esc to go back.")
         .style(Style::default().fg(Color::DarkGray));
     f.render_widget(msg, area);
+}
+
+// ─── Helpers ───
+
+fn short_path(path: &str) -> &str {
+    // Show last 2 path components
+    let parts: Vec<&str> = path.rsplit('/').take(3).collect();
+    let start = path.len().saturating_sub(parts.iter().map(|p| p.len() + 1).sum::<usize>());
+    &path[start..]
 }
