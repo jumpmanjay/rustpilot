@@ -418,7 +418,7 @@ impl Tool for BashTool {
     }
 }
 
-// ─── Grep (ripgrep when available, fallback to built-in) ───
+// ─── Grep (native ripgrep engine) ───
 
 struct GrepTool;
 
@@ -426,14 +426,16 @@ impl Tool for GrepTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "grep".into(),
-            description: "Search for a pattern in files. Uses ripgrep (rg) when available for speed, falls back to built-in search. Respects .gitignore.".into(),
+            description: "Search for a regex pattern in files. Uses ripgrep's engine natively — fast, respects .gitignore, skips binary files. Supports full regex syntax.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "pattern": { "type": "string", "description": "Search pattern (regex when using ripgrep, substring for fallback)" },
+                    "pattern": { "type": "string", "description": "Search pattern (regex by default, or literal with fixed_strings)" },
                     "path": { "type": "string", "description": "Directory to search in (default: project root)" },
                     "include": { "type": "string", "description": "File glob pattern to include (e.g., '*.rs', '*.py')" },
-                    "fixed_strings": { "type": "boolean", "description": "Treat pattern as literal string, not regex (default: false)" }
+                    "fixed_strings": { "type": "boolean", "description": "Treat pattern as literal string, not regex (default: false)" },
+                    "case_insensitive": { "type": "boolean", "description": "Case-insensitive search (default: true)" },
+                    "max_results": { "type": "integer", "description": "Maximum number of matching lines (default: 200)" }
                 },
                 "required": ["pattern"]
             }),
@@ -448,108 +450,113 @@ impl Tool for GrepTool {
             .unwrap_or_else(|| cwd.to_string());
         let include = input["include"].as_str();
         let fixed = input["fixed_strings"].as_bool().unwrap_or(false);
+        let case_insensitive = input["case_insensitive"].as_bool().unwrap_or(true);
+        let max_results = input["max_results"].as_u64().unwrap_or(200) as usize;
 
-        // Try ripgrep first
-        if let Ok(_) = std::process::Command::new("rg").arg("--version").output() {
-            let mut cmd = std::process::Command::new("rg");
-            cmd.args([
-                "--line-number",
-                "--no-heading",
-                "--color=never",
-                "--max-count=200",
-                "--max-columns=300",
-                "--max-columns-preview",
-            ]);
-            if fixed {
-                cmd.arg("--fixed-strings");
-            }
-            if let Some(glob) = include {
-                cmd.args(["--glob", glob]);
-            }
-            cmd.arg(pattern);
-            cmd.arg(&search_dir);
+        // Build the regex pattern
+        let regex_pattern = if fixed {
+            regex::escape(pattern)
+        } else {
+            pattern.to_string()
+        };
 
-            match cmd.output() {
-                Ok(output) => {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    let result = if stdout.is_empty() {
-                        format!("No matches for '{}'", pattern)
-                    } else {
-                        // Make paths relative
-                        let prefix = format!("{}/", search_dir);
-                        stdout
-                            .lines()
-                            .map(|l| l.strip_prefix(&prefix).unwrap_or(l))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    };
-                    return ToolResult {
-                        tool_use_id: String::new(),
-                        content: result,
-                        is_error: false,
-                    };
-                }
-                Err(_) => {} // Fall through to built-in
+        let matcher = match grep_regex::RegexMatcherBuilder::new()
+            .case_insensitive(case_insensitive)
+            .build(&regex_pattern)
+        {
+            Ok(m) => m,
+            Err(e) => {
+                return ToolResult {
+                    tool_use_id: String::new(),
+                    content: format!("Invalid pattern '{}': {}", pattern, e),
+                    is_error: true,
+                };
+            }
+        };
+
+        let mut searcher = grep_searcher::SearcherBuilder::new()
+            .binary_detection(grep_searcher::BinaryDetection::quit(b'\x00'))
+            .line_number(true)
+            .build();
+
+        let results = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let results_clone = results.clone();
+        let max = max_results;
+
+        // Build walker with optional glob filter
+        let mut walker_builder = ignore::WalkBuilder::new(&search_dir);
+        walker_builder.hidden(true).max_depth(Some(20));
+
+        // Apply include glob via types
+        if let Some(glob) = include {
+            let mut overrides = ignore::overrides::OverrideBuilder::new(&search_dir);
+            let _ = overrides.add(glob);
+            if let Ok(ov) = overrides.build() {
+                walker_builder.overrides(ov);
             }
         }
 
-        // Built-in fallback (case-insensitive substring search)
-        let pattern_lower = pattern.to_lowercase();
-        let mut results = Vec::new();
-        let walker = ignore::WalkBuilder::new(&search_dir)
-            .hidden(true)
-            .max_depth(Some(10))
-            .build();
+        let walker = walker_builder.build();
+        let search_dir_prefix = format!("{}/", search_dir);
 
         for entry in walker.flatten() {
             if entry.file_type().map_or(true, |ft| ft.is_dir()) {
                 continue;
             }
-            let path = entry.path();
 
-            // Include filter
-            if let Some(glob) = include {
-                let name = path.to_string_lossy();
-                let glob_clean = glob.trim_start_matches('*');
-                if !name.ends_with(glob_clean) {
-                    continue;
+            {
+                let r = results_clone.lock().unwrap();
+                if r.len() >= max {
+                    break;
                 }
             }
 
-            if let Ok(content) = std::fs::read_to_string(path) {
-                let relative = path
-                    .to_string_lossy()
-                    .strip_prefix(&search_dir)
-                    .unwrap_or(&path.to_string_lossy())
-                    .trim_start_matches('/')
-                    .to_string();
-                for (i, line) in content.lines().enumerate() {
-                    if line.to_lowercase().contains(&pattern_lower) {
-                        results.push(format!("{}:{}: {}", relative, i + 1, line.trim()));
-                        if results.len() >= 200 {
-                            break;
-                        }
+            let file_path = entry.path();
+            let relative = file_path
+                .to_string_lossy()
+                .strip_prefix(&search_dir_prefix)
+                .unwrap_or(&file_path.to_string_lossy())
+                .to_string();
+
+            let results_inner = results_clone.clone();
+            let rel = relative.clone();
+
+            let _ = searcher.search_path(
+                &matcher,
+                file_path,
+                grep_searcher::sinks::UTF8(move |line_num, line| {
+                    let mut r = results_inner.lock().unwrap();
+                    if r.len() >= max {
+                        return Ok(false); // stop searching
                     }
-                }
-            }
-            if results.len() >= 200 {
-                break;
-            }
+                    r.push(format!("{}:{}: {}", rel, line_num, line.trim_end()));
+                    Ok(true)
+                }),
+            );
+        }
+
+        let results = results.lock().unwrap();
+        let truncated = results.len() >= max_results;
+
+        let mut output = if results.is_empty() {
+            format!("No matches for '{}'", pattern)
+        } else {
+            results.join("\n")
+        };
+
+        if truncated {
+            output.push_str(&format!("\n\n(truncated at {} results)", max_results));
         }
 
         ToolResult {
             tool_use_id: String::new(),
-            content: if results.is_empty() {
-                format!("No matches for '{}'", pattern)
-            } else {
-                results.join("\n")
-            },
+            content: output,
             is_error: false,
         }
     }
 }
 
-// ─── Glob (find files by pattern) ───
+// ─── Glob (find files by pattern — native, no external deps) ───
 
 struct GlobTool;
 
@@ -557,12 +564,13 @@ impl Tool for GlobTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "glob".into(),
-            description: "Find files by name pattern. Uses fd when available for speed, falls back to built-in search. Respects .gitignore.".into(),
+            description: "Find files by name pattern. Fast, native, respects .gitignore. Supports substring matching and glob patterns.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "pattern": { "type": "string", "description": "File name pattern (substring match, e.g., 'test', '.rs', 'config')" },
-                    "path": { "type": "string", "description": "Directory to search in (default: project root)" }
+                    "pattern": { "type": "string", "description": "File name pattern (substring or glob like '*.rs', 'test_*.py')" },
+                    "path": { "type": "string", "description": "Directory to search in (default: project root)" },
+                    "max_results": { "type": "integer", "description": "Maximum results (default: 100)" }
                 },
                 "required": ["pattern"]
             }),
@@ -575,64 +583,62 @@ impl Tool for GlobTool {
             .as_str()
             .map(|p| resolve_path(cwd, p))
             .unwrap_or_else(|| cwd.to_string());
+        let max = input["max_results"].as_u64().unwrap_or(100) as usize;
 
-        // Try fd first
-        if let Ok(_) = std::process::Command::new("fd").arg("--version").output() {
-            let output = std::process::Command::new("fd")
-                .args(["--color=never", "--max-results=100", pattern])
-                .arg(&search_dir)
-                .output();
+        let pattern_lower = pattern.to_lowercase();
+        let is_glob = pattern.contains('*') || pattern.contains('?');
 
-            if let Ok(output) = output {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if !stdout.is_empty() {
-                    let prefix = format!("{}/", search_dir);
-                    let result = stdout
-                        .lines()
-                        .map(|l| l.strip_prefix(&prefix).unwrap_or(l))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    return ToolResult {
-                        tool_use_id: String::new(),
-                        content: result,
-                        is_error: false,
-                    };
-                }
+        let mut walker_builder = ignore::WalkBuilder::new(&search_dir);
+        walker_builder.hidden(true).max_depth(Some(20));
+
+        // If it's a glob pattern, use overrides for filtering
+        if is_glob {
+            let mut overrides = ignore::overrides::OverrideBuilder::new(&search_dir);
+            let _ = overrides.add(pattern);
+            if let Ok(ov) = overrides.build() {
+                walker_builder.overrides(ov);
             }
         }
 
-        // Built-in fallback
-        let pattern_lower = pattern.to_lowercase();
+        let walker = walker_builder.build();
+        let search_dir_prefix = format!("{}/", search_dir);
         let mut results = Vec::new();
-        let walker = ignore::WalkBuilder::new(&search_dir)
-            .hidden(true)
-            .max_depth(Some(10))
-            .build();
 
         for entry in walker.flatten() {
             if entry.file_type().map_or(true, |ft| ft.is_dir()) {
                 continue;
             }
             let path = entry.path().to_string_lossy();
-            if path.to_lowercase().contains(&pattern_lower) {
-                let relative = path
-                    .strip_prefix(&search_dir)
-                    .unwrap_or(&path)
-                    .trim_start_matches('/');
-                results.push(relative.to_string());
-                if results.len() >= 100 {
-                    break;
-                }
+            let relative = path
+                .strip_prefix(&search_dir_prefix)
+                .unwrap_or(&path)
+                .to_string();
+
+            // For non-glob patterns, do substring match
+            if !is_glob && !relative.to_lowercase().contains(&pattern_lower) {
+                continue;
             }
+
+            results.push(relative);
+            if results.len() >= max {
+                break;
+            }
+        }
+
+        let truncated = results.len() >= max;
+        let mut output = if results.is_empty() {
+            format!("No files matching '{}'", pattern)
+        } else {
+            results.join("\n")
+        };
+
+        if truncated {
+            output.push_str(&format!("\n\n(truncated at {} results)", max));
         }
 
         ToolResult {
             tool_use_id: String::new(),
-            content: if results.is_empty() {
-                format!("No files matching '{}'", pattern)
-            } else {
-                results.join("\n")
-            },
+            content: output,
             is_error: false,
         }
     }
