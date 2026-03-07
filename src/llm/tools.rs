@@ -5,6 +5,7 @@
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
+use wait_timeout::ChildExt;
 
 /// Tool definition sent to the LLM API
 #[derive(Debug, Clone, Serialize)]
@@ -69,9 +70,9 @@ impl ToolRegistry {
         reg.register(WriteFileTool);
         reg.register(EditFileTool);
         reg.register(ListDirTool);
-        reg.register(RunCommandTool);
-        reg.register(SearchFilesTool);
+        reg.register(BashTool);
         reg.register(GrepTool);
+        reg.register(GlobTool);
         reg.register(SkillTool::new());
         reg
     }
@@ -85,13 +86,13 @@ impl Tool for ReadFileTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "read_file".into(),
-            description: "Read the contents of a file. Returns the file content as text.".into(),
+            description: "Read the contents of a file. Returns the file content with line numbers. For large files, use offset/limit to read specific sections.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Path to the file to read" },
-                    "start_line": { "type": "integer", "description": "Optional start line (1-indexed)" },
-                    "end_line": { "type": "integer", "description": "Optional end line (inclusive)" }
+                    "path": { "type": "string", "description": "Path to the file to read (relative to project root)" },
+                    "offset": { "type": "integer", "description": "Start line (1-indexed, default: 1)" },
+                    "limit": { "type": "integer", "description": "Maximum number of lines to read (default: all)" }
                 },
                 "required": ["path"]
             }),
@@ -104,22 +105,23 @@ impl Tool for ReadFileTool {
 
         match std::fs::read_to_string(&full_path) {
             Ok(content) => {
-                let start = input["start_line"].as_u64().map(|n| n as usize);
-                let end = input["end_line"].as_u64().map(|n| n as usize);
+                let lines: Vec<&str> = content.lines().collect();
+                let total = lines.len();
+                let offset = input["offset"].as_u64().unwrap_or(1).max(1) as usize;
+                let start = offset.saturating_sub(1);
+                let limit = input["limit"].as_u64().map(|n| n as usize).unwrap_or(total);
+                let end = (start + limit).min(total);
 
-                let output = if let Some(start) = start {
-                    let lines: Vec<&str> = content.lines().collect();
-                    let start_idx = start.saturating_sub(1);
-                    let end_idx = end.unwrap_or(lines.len()).min(lines.len());
-                    lines[start_idx..end_idx]
-                        .iter()
-                        .enumerate()
-                        .map(|(i, l)| format!("{:>4} | {}", start_idx + i + 1, l))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                } else {
-                    content
-                };
+                let numbered: Vec<String> = lines[start..end]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| format!("{:>4} | {}", start + i + 1, l))
+                    .collect();
+
+                let mut output = numbered.join("\n");
+                if end < total {
+                    output.push_str(&format!("\n\n({} more lines, {} total)", total - end, total));
+                }
 
                 ToolResult {
                     tool_use_id: String::new(),
@@ -161,7 +163,6 @@ impl Tool for WriteFileTool {
         let content = input["content"].as_str().unwrap_or("");
         let full_path = resolve_path(cwd, path);
 
-        // Create parent dirs
         if let Some(parent) = std::path::Path::new(&full_path).parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -189,12 +190,12 @@ impl Tool for EditFileTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "edit_file".into(),
-            description: "Edit a file by replacing exact text. The old_text must match exactly (including whitespace).".into(),
+            description: "Edit a file by replacing exact text. The old_text must match exactly (including whitespace and indentation). Only the first match is replaced.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "Path to the file" },
-                    "old_text": { "type": "string", "description": "Exact text to find" },
+                    "old_text": { "type": "string", "description": "Exact text to find (must match including whitespace)" },
                     "new_text": { "type": "string", "description": "Replacement text" }
                 },
                 "required": ["path", "old_text", "new_text"]
@@ -294,20 +295,21 @@ impl Tool for ListDirTool {
     }
 }
 
-// ─── Run Command ───
+// ─── Bash (shell command execution with timeout) ───
 
-struct RunCommandTool;
+struct BashTool;
 
-impl Tool for RunCommandTool {
+impl Tool for BashTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
-            name: "run_command".into(),
-            description: "Run a shell command and return its output. Use for compilation, tests, git, etc.".into(),
+            name: "bash".into(),
+            description: "Run a shell command and return stdout/stderr. Use for compilation, tests, git, package management, etc. Commands run in bash.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string", "description": "Shell command to execute" },
-                    "cwd": { "type": "string", "description": "Working directory (optional, defaults to project root)" }
+                    "cwd": { "type": "string", "description": "Working directory (optional, defaults to project root)" },
+                    "timeout": { "type": "integer", "description": "Timeout in seconds (default: 120, max: 600)" }
                 },
                 "required": ["command"]
             }),
@@ -316,65 +318,119 @@ impl Tool for RunCommandTool {
 
     fn execute(&self, input: &Value, cwd: &str) -> ToolResult {
         let command = input["command"].as_str().unwrap_or("");
-        let work_dir = input["cwd"].as_str().map(|p| resolve_path(cwd, p)).unwrap_or_else(|| cwd.to_string());
+        let work_dir = input["cwd"]
+            .as_str()
+            .map(|p| resolve_path(cwd, p))
+            .unwrap_or_else(|| cwd.to_string());
+        let timeout_secs = input["timeout"].as_u64().unwrap_or(120).min(600);
 
-        match std::process::Command::new("sh")
+        use std::process::Command;
+        use std::time::Duration;
+
+        let mut child = match Command::new("bash")
             .args(["-c", command])
             .current_dir(&work_dir)
-            .output()
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
         {
-            Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let mut result = String::new();
+            Ok(c) => c,
+            Err(e) => {
+                return ToolResult {
+                    tool_use_id: String::new(),
+                    content: format!("Error spawning command: {}", e),
+                    is_error: true,
+                };
+            }
+        };
+
+        // Wait with timeout
+        let result = match child.wait_timeout(Duration::from_secs(timeout_secs)) {
+            Ok(Some(status)) => {
+                let stdout = child
+                    .stdout
+                    .take()
+                    .map(|mut s| {
+                        let mut buf = String::new();
+                        use std::io::Read;
+                        let _ = s.read_to_string(&mut buf);
+                        buf
+                    })
+                    .unwrap_or_default();
+                let stderr = child
+                    .stderr
+                    .take()
+                    .map(|mut s| {
+                        let mut buf = String::new();
+                        use std::io::Read;
+                        let _ = s.read_to_string(&mut buf);
+                        buf
+                    })
+                    .unwrap_or_default();
+
+                let mut output = String::new();
                 if !stdout.is_empty() {
-                    result.push_str(&stdout);
+                    output.push_str(&stdout);
                 }
                 if !stderr.is_empty() {
-                    if !result.is_empty() {
-                        result.push('\n');
+                    if !output.is_empty() {
+                        output.push('\n');
                     }
-                    result.push_str("[stderr]\n");
-                    result.push_str(&stderr);
+                    output.push_str("[stderr]\n");
+                    output.push_str(&stderr);
                 }
+
                 // Truncate very long output
-                if result.len() > 50000 {
-                    result.truncate(50000);
-                    result.push_str("\n... (truncated)");
+                if output.len() > 100_000 {
+                    output.truncate(100_000);
+                    output.push_str("\n... (truncated)");
                 }
-                ToolResult {
-                    tool_use_id: String::new(),
-                    content: if result.is_empty() {
-                        format!("Command completed with exit code {}", output.status.code().unwrap_or(-1))
-                    } else {
-                        result
-                    },
-                    is_error: !output.status.success(),
+
+                let is_error = !status.success();
+                if output.is_empty() {
+                    output = format!(
+                        "Command completed with exit code {}",
+                        status.code().unwrap_or(-1)
+                    );
                 }
+                (output, is_error)
             }
-            Err(e) => ToolResult {
-                tool_use_id: String::new(),
-                content: format!("Error running command: {}", e),
-                is_error: true,
-            },
+            Ok(None) => {
+                // Timeout — kill the process
+                let _ = child.kill();
+                let _ = child.wait();
+                (
+                    format!("Command timed out after {}s and was killed", timeout_secs),
+                    true,
+                )
+            }
+            Err(e) => (format!("Error waiting for command: {}", e), true),
+        };
+
+        ToolResult {
+            tool_use_id: String::new(),
+            content: result.0,
+            is_error: result.1,
         }
     }
 }
 
-// ─── Search Files (find by name) ───
+// ─── Grep (ripgrep when available, fallback to built-in) ───
 
-struct SearchFilesTool;
+struct GrepTool;
 
-impl Tool for SearchFilesTool {
+impl Tool for GrepTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
-            name: "search_files".into(),
-            description: "Search for files by name pattern in the workspace. Respects .gitignore.".into(),
+            name: "grep".into(),
+            description: "Search for a pattern in files. Uses ripgrep (rg) when available for speed, falls back to built-in search. Respects .gitignore.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "pattern": { "type": "string", "description": "File name pattern to search for (case-insensitive substring)" },
-                    "path": { "type": "string", "description": "Directory to search in (default: workspace root)" }
+                    "pattern": { "type": "string", "description": "Search pattern (regex when using ripgrep, substring for fallback)" },
+                    "path": { "type": "string", "description": "Directory to search in (default: project root)" },
+                    "include": { "type": "string", "description": "File glob pattern to include (e.g., '*.rs', '*.py')" },
+                    "fixed_strings": { "type": "boolean", "description": "Treat pattern as literal string, not regex (default: false)" }
                 },
                 "required": ["pattern"]
             }),
@@ -383,9 +439,167 @@ impl Tool for SearchFilesTool {
 
     fn execute(&self, input: &Value, cwd: &str) -> ToolResult {
         let pattern = input["pattern"].as_str().unwrap_or("");
-        let search_dir = input["path"].as_str().map(|p| resolve_path(cwd, p)).unwrap_or_else(|| cwd.to_string());
-        let pattern_lower = pattern.to_lowercase();
+        let search_dir = input["path"]
+            .as_str()
+            .map(|p| resolve_path(cwd, p))
+            .unwrap_or_else(|| cwd.to_string());
+        let include = input["include"].as_str();
+        let fixed = input["fixed_strings"].as_bool().unwrap_or(false);
 
+        // Try ripgrep first
+        if let Ok(_) = std::process::Command::new("rg").arg("--version").output() {
+            let mut cmd = std::process::Command::new("rg");
+            cmd.args([
+                "--line-number",
+                "--no-heading",
+                "--color=never",
+                "--max-count=200",
+                "--max-columns=300",
+                "--max-columns-preview",
+            ]);
+            if fixed {
+                cmd.arg("--fixed-strings");
+            }
+            if let Some(glob) = include {
+                cmd.args(["--glob", glob]);
+            }
+            cmd.arg(pattern);
+            cmd.arg(&search_dir);
+
+            match cmd.output() {
+                Ok(output) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let result = if stdout.is_empty() {
+                        format!("No matches for '{}'", pattern)
+                    } else {
+                        // Make paths relative
+                        let prefix = format!("{}/", search_dir);
+                        stdout
+                            .lines()
+                            .map(|l| l.strip_prefix(&prefix).unwrap_or(l))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    };
+                    return ToolResult {
+                        tool_use_id: String::new(),
+                        content: result,
+                        is_error: false,
+                    };
+                }
+                Err(_) => {} // Fall through to built-in
+            }
+        }
+
+        // Built-in fallback (case-insensitive substring search)
+        let pattern_lower = pattern.to_lowercase();
+        let mut results = Vec::new();
+        let walker = ignore::WalkBuilder::new(&search_dir)
+            .hidden(true)
+            .max_depth(Some(10))
+            .build();
+
+        for entry in walker.flatten() {
+            if entry.file_type().map_or(true, |ft| ft.is_dir()) {
+                continue;
+            }
+            let path = entry.path();
+
+            // Include filter
+            if let Some(glob) = include {
+                let name = path.to_string_lossy();
+                let glob_clean = glob.trim_start_matches('*');
+                if !name.ends_with(glob_clean) {
+                    continue;
+                }
+            }
+
+            if let Ok(content) = std::fs::read_to_string(path) {
+                let relative = path
+                    .to_string_lossy()
+                    .strip_prefix(&search_dir)
+                    .unwrap_or(&path.to_string_lossy())
+                    .trim_start_matches('/')
+                    .to_string();
+                for (i, line) in content.lines().enumerate() {
+                    if line.to_lowercase().contains(&pattern_lower) {
+                        results.push(format!("{}:{}: {}", relative, i + 1, line.trim()));
+                        if results.len() >= 200 {
+                            break;
+                        }
+                    }
+                }
+            }
+            if results.len() >= 200 {
+                break;
+            }
+        }
+
+        ToolResult {
+            tool_use_id: String::new(),
+            content: if results.is_empty() {
+                format!("No matches for '{}'", pattern)
+            } else {
+                results.join("\n")
+            },
+            is_error: false,
+        }
+    }
+}
+
+// ─── Glob (find files by pattern) ───
+
+struct GlobTool;
+
+impl Tool for GlobTool {
+    fn definition(&self) -> ToolDef {
+        ToolDef {
+            name: "glob".into(),
+            description: "Find files by name pattern. Uses fd when available for speed, falls back to built-in search. Respects .gitignore.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string", "description": "File name pattern (substring match, e.g., 'test', '.rs', 'config')" },
+                    "path": { "type": "string", "description": "Directory to search in (default: project root)" }
+                },
+                "required": ["pattern"]
+            }),
+        }
+    }
+
+    fn execute(&self, input: &Value, cwd: &str) -> ToolResult {
+        let pattern = input["pattern"].as_str().unwrap_or("");
+        let search_dir = input["path"]
+            .as_str()
+            .map(|p| resolve_path(cwd, p))
+            .unwrap_or_else(|| cwd.to_string());
+
+        // Try fd first
+        if let Ok(_) = std::process::Command::new("fd").arg("--version").output() {
+            let output = std::process::Command::new("fd")
+                .args(["--color=never", "--max-results=100", pattern])
+                .arg(&search_dir)
+                .output();
+
+            if let Ok(output) = output {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if !stdout.is_empty() {
+                    let prefix = format!("{}/", search_dir);
+                    let result = stdout
+                        .lines()
+                        .map(|l| l.strip_prefix(&prefix).unwrap_or(l))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return ToolResult {
+                        tool_use_id: String::new(),
+                        content: result,
+                        is_error: false,
+                    };
+                }
+            }
+        }
+
+        // Built-in fallback
+        let pattern_lower = pattern.to_lowercase();
         let mut results = Vec::new();
         let walker = ignore::WalkBuilder::new(&search_dir)
             .hidden(true)
@@ -403,7 +617,7 @@ impl Tool for SearchFilesTool {
                     .unwrap_or(&path)
                     .trim_start_matches('/');
                 results.push(relative.to_string());
-                if results.len() >= 50 {
+                if results.len() >= 100 {
                     break;
                 }
             }
@@ -421,95 +635,6 @@ impl Tool for SearchFilesTool {
     }
 }
 
-// ─── Grep (search file contents) ───
-
-struct GrepTool;
-
-impl Tool for GrepTool {
-    fn definition(&self) -> ToolDef {
-        ToolDef {
-            name: "grep".into(),
-            description: "Search for text in files across the workspace. Returns matching lines with file paths and line numbers.".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "pattern": { "type": "string", "description": "Text to search for (case-insensitive)" },
-                    "path": { "type": "string", "description": "Directory to search in (default: workspace root)" },
-                    "file_pattern": { "type": "string", "description": "Optional file name filter (e.g., '*.rs')" }
-                },
-                "required": ["pattern"]
-            }),
-        }
-    }
-
-    fn execute(&self, input: &Value, cwd: &str) -> ToolResult {
-        let pattern = input["pattern"].as_str().unwrap_or("");
-        let search_dir = input["path"].as_str().map(|p| resolve_path(cwd, p)).unwrap_or_else(|| cwd.to_string());
-        let file_pattern = input["file_pattern"].as_str();
-        let pattern_lower = pattern.to_lowercase();
-
-        let mut results = Vec::new();
-        let walker = ignore::WalkBuilder::new(&search_dir)
-            .hidden(true)
-            .max_depth(Some(10))
-            .build();
-
-        for entry in walker.flatten() {
-            if entry.file_type().map_or(true, |ft| ft.is_dir()) {
-                continue;
-            }
-            let path = entry.path();
-            let path_str = path.to_string_lossy();
-
-            // File pattern filter
-            if let Some(fp) = file_pattern {
-                let fp_clean = fp.trim_start_matches('*');
-                if !path_str.ends_with(fp_clean) {
-                    continue;
-                }
-            }
-
-            if let Ok(content) = std::fs::read_to_string(path) {
-                let relative = path_str
-                    .strip_prefix(&search_dir)
-                    .unwrap_or(&path_str)
-                    .trim_start_matches('/');
-                for (i, line) in content.lines().enumerate() {
-                    if line.to_lowercase().contains(&pattern_lower) {
-                        results.push(format!("{}:{}: {}", relative, i + 1, line.trim()));
-                        if results.len() >= 100 {
-                            break;
-                        }
-                    }
-                }
-            }
-            if results.len() >= 100 {
-                break;
-            }
-        }
-
-        ToolResult {
-            tool_use_id: String::new(),
-            content: if results.is_empty() {
-                format!("No matches for '{}'", pattern)
-            } else {
-                results.join("\n")
-            },
-            is_error: false,
-        }
-    }
-}
-
-// ─── Helpers ───
-
-fn resolve_path(cwd: &str, path: &str) -> String {
-    if path.starts_with('/') {
-        path.to_string()
-    } else {
-        format!("{}/{}", cwd, path)
-    }
-}
-
 // ─── Skill (load on-demand skill instructions) ───
 
 struct SkillTool {
@@ -519,9 +644,7 @@ struct SkillTool {
 
 impl SkillTool {
     fn new() -> Self {
-        // Load skill index from config
         let config = crate::config::Config::load_or_default().unwrap_or_else(|_| {
-            // Return a minimal config if loading fails
             panic!("Failed to load config for skill discovery");
         });
 
@@ -531,7 +654,10 @@ impl SkillTool {
             .map(|(name, def)| {
                 (
                     name.clone(),
-                    (def.description.clone(), def.path.to_string_lossy().to_string()),
+                    (
+                        def.description.clone(),
+                        def.path.to_string_lossy().to_string(),
+                    ),
                 )
             })
             .collect();
@@ -569,14 +695,11 @@ impl Tool for SkillTool {
 
         if let Some((_, path)) = self.skills.get(name) {
             match std::fs::read_to_string(path) {
-                Ok(content) => {
-                    // Return the full SKILL.md content (frontmatter + body)
-                    ToolResult {
-                        tool_use_id: String::new(),
-                        content,
-                        is_error: false,
-                    }
-                }
+                Ok(content) => ToolResult {
+                    tool_use_id: String::new(),
+                    content,
+                    is_error: false,
+                },
                 Err(e) => ToolResult {
                     tool_use_id: String::new(),
                     content: format!("Error loading skill '{}': {}", name, e),
@@ -590,11 +713,25 @@ impl Tool for SkillTool {
                 content: format!(
                     "Unknown skill '{}'. Available: {}",
                     name,
-                    if available.is_empty() { "(none)".to_string() } else { available.join(", ") }
+                    if available.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        available.join(", ")
+                    }
                 ),
                 is_error: true,
             }
         }
+    }
+}
+
+// ─── Helpers ───
+
+fn resolve_path(cwd: &str, path: &str) -> String {
+    if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("{}/{}", cwd, path)
     }
 }
 
