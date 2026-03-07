@@ -32,6 +32,10 @@ pub struct Config {
     /// LLM defaults (convenience shorthand — overridden by agent-specific settings)
     #[serde(default)]
     pub llm: LlmDefaults,
+
+    /// Discovered skills (populated at load time, not serialized to config file)
+    #[serde(skip)]
+    pub skills: HashMap<String, SkillDef>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -83,6 +87,25 @@ pub struct AgentDef {
     /// Disable this agent
     #[serde(default)]
     pub disable: bool,
+}
+
+/// A discovered skill definition (from SKILL.md frontmatter)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillDef {
+    pub name: String,
+    pub description: String,
+    #[serde(default)]
+    pub license: Option<String>,
+    #[serde(default)]
+    pub compatibility: Option<String>,
+    #[serde(default)]
+    pub metadata: HashMap<String, String>,
+    /// Full path to SKILL.md (resolved at load time, not serialized from frontmatter)
+    #[serde(skip)]
+    pub path: PathBuf,
+    /// The body content (below frontmatter) — loaded on demand
+    #[serde(skip)]
+    pub body: String,
 }
 
 /// Convenience LLM defaults (shorthand for users who don't need multi-agent)
@@ -156,6 +179,7 @@ impl Config {
             let mut config: Config = serde_yaml::from_str(&content)?;
             config.load_markdown_agents();
             config.load_agents_md_rules();
+            config.load_skills();
             Ok(config)
         } else if toml_path.exists() {
             // Migrate: read the old toml, write new yaml, keep toml as backup
@@ -171,6 +195,7 @@ impl Config {
             let _ = std::fs::rename(&toml_path, &backup);
             config.load_markdown_agents();
             config.load_agents_md_rules();
+            config.load_skills();
             Ok(config)
         } else {
             let mut config = Config {
@@ -181,6 +206,7 @@ impl Config {
                 rules: Vec::new(),
                 instructions: Vec::new(),
                 llm: LlmDefaults::default(),
+                skills: HashMap::new(),
             };
             // Write default config
             std::fs::create_dir_all(yaml_path.parent().unwrap())?;
@@ -188,6 +214,7 @@ impl Config {
             std::fs::write(&yaml_path, &yaml_str)?;
             config.load_markdown_agents();
             config.load_agents_md_rules();
+            config.load_skills();
             Ok(config)
         }
     }
@@ -249,6 +276,7 @@ impl Config {
                 system_prompt: default_system_prompt(),
                 max_turns: default_max_turns(),
             },
+            skills: HashMap::new(),
         })
     }
 
@@ -371,6 +399,86 @@ impl Config {
                 break;
             }
         }
+    }
+
+    /// Discover skills from SKILL.md files across standard locations.
+    /// Compatible with opencode/Claude Code skill paths.
+    fn load_skills(&mut self) {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+        let search_dirs = [
+            // Global
+            home.join(".rustpilot/skills"),
+            home.join(".config/opencode/skills"),
+            home.join(".claude/skills"),
+            home.join(".agents/skills"),
+            // Project
+            cwd.join(".rustpilot/skills"),
+            cwd.join(".opencode/skills"),
+            cwd.join(".claude/skills"),
+            cwd.join(".agents/skills"),
+        ];
+
+        for dir in &search_dirs {
+            if !dir.is_dir() {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(dir) else { continue };
+            for entry in entries.flatten() {
+                let skill_dir = entry.path();
+                if !skill_dir.is_dir() {
+                    continue;
+                }
+                let skill_md = skill_dir.join("SKILL.md");
+                if !skill_md.is_file() {
+                    continue;
+                }
+                let Ok(content) = std::fs::read_to_string(&skill_md) else { continue };
+                if let Some(mut skill) = Self::parse_skill_md(&content) {
+                    skill.path = skill_md;
+                    // First discovery wins (project overrides global due to search order,
+                    // but we want project to win, so don't overwrite)
+                    self.skills.entry(skill.name.clone()).or_insert(skill);
+                }
+            }
+        }
+    }
+
+    /// Parse a SKILL.md file: YAML frontmatter + markdown body
+    fn parse_skill_md(content: &str) -> Option<SkillDef> {
+        let content = content.trim();
+        if !content.starts_with("---") {
+            return None;
+        }
+        let rest = &content[3..];
+        let end = rest.find("\n---")?;
+        let frontmatter = &rest[..end];
+        let body = rest[end + 4..].trim().to_string();
+
+        let mut skill: SkillDef = serde_yaml::from_str(frontmatter).ok()?;
+        if skill.name.is_empty() || skill.description.is_empty() {
+            return None;
+        }
+        skill.body = body;
+        Some(skill)
+    }
+
+    /// Build the <available_skills> XML block for injection into agent system prompts
+    #[allow(dead_code)]
+    pub fn skills_xml(&self) -> String {
+        if self.skills.is_empty() {
+            return String::new();
+        }
+        let mut xml = String::from("\n\n<available_skills>\n");
+        for skill in self.skills.values() {
+            xml.push_str(&format!(
+                "  <skill>\n    <name>{}</name>\n    <description>{}</description>\n  </skill>\n",
+                skill.name, skill.description
+            ));
+        }
+        xml.push_str("</available_skills>\n");
+        xml
     }
 
     /// Resolve the API key: check provider map first, fall back to llm.api_key

@@ -72,6 +72,7 @@ impl ToolRegistry {
         reg.register(RunCommandTool);
         reg.register(SearchFilesTool);
         reg.register(GrepTool);
+        reg.register(SkillTool::new());
         reg
     }
 }
@@ -506,6 +507,94 @@ fn resolve_path(cwd: &str, path: &str) -> String {
         path.to_string()
     } else {
         format!("{}/{}", cwd, path)
+    }
+}
+
+// ─── Skill (load on-demand skill instructions) ───
+
+struct SkillTool {
+    /// Map of skill name → (description, SKILL.md path)
+    skills: HashMap<String, (String, String)>,
+}
+
+impl SkillTool {
+    fn new() -> Self {
+        // Load skill index from config
+        let config = crate::config::Config::load_or_default().unwrap_or_else(|_| {
+            // Return a minimal config if loading fails
+            panic!("Failed to load config for skill discovery");
+        });
+
+        let skills: HashMap<String, (String, String)> = config
+            .skills
+            .iter()
+            .map(|(name, def)| {
+                (
+                    name.clone(),
+                    (def.description.clone(), def.path.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+
+        Self { skills }
+    }
+}
+
+impl Tool for SkillTool {
+    fn definition(&self) -> ToolDef {
+        let mut desc = "Load a skill's full instructions by name. Available skills:".to_string();
+        if self.skills.is_empty() {
+            desc.push_str("\n(no skills discovered)");
+        } else {
+            for (name, (description, _)) in &self.skills {
+                desc.push_str(&format!("\n- {}: {}", name, description));
+            }
+        }
+
+        ToolDef {
+            name: "skill".into(),
+            description: desc,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Name of the skill to load" }
+                },
+                "required": ["name"]
+            }),
+        }
+    }
+
+    fn execute(&self, input: &Value, _cwd: &str) -> ToolResult {
+        let name = input["name"].as_str().unwrap_or("");
+
+        if let Some((_, path)) = self.skills.get(name) {
+            match std::fs::read_to_string(path) {
+                Ok(content) => {
+                    // Return the full SKILL.md content (frontmatter + body)
+                    ToolResult {
+                        tool_use_id: String::new(),
+                        content,
+                        is_error: false,
+                    }
+                }
+                Err(e) => ToolResult {
+                    tool_use_id: String::new(),
+                    content: format!("Error loading skill '{}': {}", name, e),
+                    is_error: true,
+                },
+            }
+        } else {
+            let available: Vec<&str> = self.skills.keys().map(|s| s.as_str()).collect();
+            ToolResult {
+                tool_use_id: String::new(),
+                content: format!(
+                    "Unknown skill '{}'. Available: {}",
+                    name,
+                    if available.is_empty() { "(none)".to_string() } else { available.join(", ") }
+                ),
+                is_error: true,
+            }
+        }
     }
 }
 
