@@ -153,23 +153,27 @@ impl Config {
 
         if yaml_path.exists() {
             let content = std::fs::read_to_string(&yaml_path)?;
-            let config: Config = serde_yaml::from_str(&content)?;
+            let mut config: Config = serde_yaml::from_str(&content)?;
+            config.load_markdown_agents();
+            config.load_agents_md_rules();
             Ok(config)
         } else if toml_path.exists() {
             // Migrate: read the old toml, write new yaml, keep toml as backup
             eprintln!("Migrating config.toml → config.yaml");
             let content = std::fs::read_to_string(&toml_path)?;
             // Parse the old flat toml format into the new Config
-            let config = Self::from_legacy_toml(&content)?;
+            let mut config = Self::from_legacy_toml(&content)?;
             // Write the new yaml
             let yaml_str = serde_yaml::to_string(&config)?;
             std::fs::write(&yaml_path, &yaml_str)?;
             // Rename old file
             let backup = toml_path.with_extension("toml.bak");
             let _ = std::fs::rename(&toml_path, &backup);
+            config.load_markdown_agents();
+            config.load_agents_md_rules();
             Ok(config)
         } else {
-            let config = Config {
+            let mut config = Config {
                 data_dir: default_data_dir(),
                 model: default_model(),
                 provider: HashMap::new(),
@@ -182,6 +186,8 @@ impl Config {
             std::fs::create_dir_all(yaml_path.parent().unwrap())?;
             let yaml_str = serde_yaml::to_string(&config)?;
             std::fs::write(&yaml_path, &yaml_str)?;
+            config.load_markdown_agents();
+            config.load_agents_md_rules();
             Ok(config)
         }
     }
@@ -244,6 +250,127 @@ impl Config {
                 max_turns: default_max_turns(),
             },
         })
+    }
+
+    /// Load agent definitions from markdown files with YAML frontmatter.
+    /// Searches (in order, later overrides earlier):
+    ///   - ~/.rustpilot/agents/*.md        (global)
+    ///   - ~/.config/opencode/agents/*.md  (opencode global compat)
+    ///   - .rustpilot/agents/*.md          (project)
+    ///   - .opencode/agents/*.md           (opencode project compat)
+    fn load_markdown_agents(&mut self) {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+        let search_dirs = [
+            home.join(".rustpilot").join("agents"),
+            home.join(".config/opencode/agents"),
+            cwd.join(".rustpilot/agents"),
+            cwd.join(".opencode/agents"),
+        ];
+
+        for dir in &search_dirs {
+            if !dir.is_dir() {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(dir) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                    continue;
+                }
+                let agent_name = path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                if agent_name.is_empty() {
+                    continue;
+                }
+
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if let Some(agent_def) = Self::parse_agent_markdown(&content) {
+                        // Only insert if not already defined in config.yaml
+                        // (config.yaml takes precedence over markdown files)
+                        self.agent.entry(agent_name).or_insert(agent_def);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Parse a markdown agent file with YAML frontmatter.
+    /// Format:
+    /// ```
+    /// ---
+    /// description: Reviews code
+    /// mode: subagent
+    /// model: anthropic/claude-sonnet-4-20250514
+    /// tools:
+    ///   write: false
+    /// ---
+    /// You are a code reviewer. Focus on...
+    /// ```
+    fn parse_agent_markdown(content: &str) -> Option<AgentDef> {
+        let content = content.trim();
+        if !content.starts_with("---") {
+            return None;
+        }
+
+        // Find the closing ---
+        let rest = &content[3..];
+        let end = rest.find("\n---")?;
+        let frontmatter = &rest[..end];
+        let body = rest[end + 4..].trim();
+
+        // Parse frontmatter as YAML into AgentDef
+        let mut agent_def: AgentDef = serde_yaml::from_str(frontmatter).ok()?;
+
+        // If no prompt was set in frontmatter, use the markdown body
+        if agent_def.prompt.is_none() && !body.is_empty() {
+            agent_def.prompt = Some(body.to_string());
+        }
+
+        Some(agent_def)
+    }
+
+    /// Load rules from AGENTS.md / CLAUDE.md files (project + global).
+    /// These are appended to `self.rules`.
+    fn load_agents_md_rules(&mut self) {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+        // Global rules (first match wins per location)
+        let global_paths = [
+            home.join(".rustpilot/AGENTS.md"),
+            home.join(".config/opencode/AGENTS.md"),
+            home.join(".claude/CLAUDE.md"),
+        ];
+
+        // Project rules (first match wins per location)
+        let project_paths = [
+            cwd.join("AGENTS.md"),
+            cwd.join("CLAUDE.md"),
+        ];
+
+        // Load global (use first that exists)
+        for path in &global_paths {
+            if path.is_file() {
+                if let Ok(content) = std::fs::read_to_string(path) {
+                    self.rules.push(format!("# Global Rules (from {})\n{}", path.display(), content));
+                }
+                break;
+            }
+        }
+
+        // Load project (use first that exists)
+        for path in &project_paths {
+            if path.is_file() {
+                if let Ok(content) = std::fs::read_to_string(path) {
+                    self.rules.push(format!("# Project Rules (from {})\n{}", path.display(), content));
+                }
+                break;
+            }
+        }
     }
 
     /// Resolve the API key: check provider map first, fall back to llm.api_key

@@ -23,6 +23,9 @@ pub struct LlmManager {
 
     /// Active agents (kept for reference, actual work happens in spawned tasks)
     pub agents: HashMap<AgentId, AgentInfo>,
+
+    /// Global rules loaded from config + AGENTS.md
+    global_rules: Vec<String>,
 }
 
 /// Info about a running agent (metadata kept in main thread)
@@ -65,6 +68,7 @@ impl LlmManager {
             rx,
             tx,
             agents: HashMap::new(),
+            global_rules: config.rules.clone(),
         }
     }
 
@@ -134,6 +138,7 @@ impl LlmManager {
         let model = self.agents.get(&id).map(|a| a.model.clone()).unwrap_or_else(|| self.default_model.clone());
         let max_tokens = self.default_max_tokens;
         let history = history.to_vec();
+        let global_rules = self.global_rules.clone();
 
         if api_key.is_empty() {
             let _ = tx.send((
@@ -151,10 +156,21 @@ impl LlmManager {
         // Spawn the agentic loop in a background task
         let agent_id = id.clone();
         tokio::spawn(async move {
+            let mut system_prompt = "You are a helpful coding assistant. You have access to tools for reading, writing, and editing files, running commands, and searching the codebase. Use them to help the user.".to_string();
+
+            // Append global rules from config + AGENTS.md
+            if !global_rules.is_empty() {
+                system_prompt.push_str("\n\n## Rules\n");
+                for rule in &global_rules {
+                    system_prompt.push_str(rule);
+                    system_prompt.push('\n');
+                }
+            }
+
             let config = AgentConfig {
                 model,
                 max_tokens,
-                system_prompt: "You are a helpful coding assistant. You have access to tools for reading, writing, and editing files, running commands, and searching the codebase. Use them to help the user.".into(),
+                system_prompt,
                 ..Default::default()
             };
             let mut agent = Agent::new(config, &cwd);
