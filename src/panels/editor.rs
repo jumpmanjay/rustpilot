@@ -1,6 +1,29 @@
 /// Shared text editing buffer with undo/redo, clipboard, word navigation, etc.
 /// Used by both the Code editor and the Prompt composer.
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::sync::Mutex;
+
+/// Fallback clipboard shared across all TextBuffer instances
+static INTERNAL_CLIPBOARD: Mutex<String> = Mutex::new(String::new());
+
+fn clipboard_set(text: &str) {
+    // Try system clipboard first, fall back to internal
+    if cli_clipboard::set_contents(text.to_string()).is_err() {
+        if let Ok(mut cb) = INTERNAL_CLIPBOARD.lock() {
+            *cb = text.to_string();
+        }
+    }
+}
+
+fn clipboard_get() -> String {
+    // Try system clipboard first, fall back to internal
+    cli_clipboard::get_contents().unwrap_or_else(|_| {
+        INTERNAL_CLIPBOARD
+            .lock()
+            .map(|cb| cb.clone())
+            .unwrap_or_default()
+    })
+}
 
 #[derive(Debug, Clone)]
 struct UndoEntry {
@@ -19,9 +42,6 @@ pub struct TextBuffer {
 
     // Selection: anchor point (if Some, selection is anchor..cursor)
     pub select_anchor: Option<(usize, usize)>, // (row, col)
-
-    // Internal clipboard
-    clipboard: Vec<String>,
 
     // Undo/redo
     undo_stack: Vec<UndoEntry>,
@@ -48,7 +68,6 @@ impl TextBuffer {
             scroll_col: 0,
             modified: false,
             select_anchor: None,
-            clipboard: Vec::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             undo_batch: false,
@@ -247,15 +266,13 @@ impl TextBuffer {
     // ─── Clipboard ───
 
     pub fn copy(&mut self) {
-        if let Some(text) = self.selected_text() {
-            self.clipboard = text.lines().map(|l| l.to_string()).collect();
-            if self.clipboard.is_empty() {
-                self.clipboard.push(String::new());
-            }
+        let text = if let Some(text) = self.selected_text() {
+            text
         } else {
             // No selection: copy current line
-            self.clipboard = vec![self.lines[self.cursor_row].clone()];
-        }
+            self.lines[self.cursor_row].clone() + "\n"
+        };
+        clipboard_set(&text);
     }
 
     pub fn cut(&mut self) {
@@ -280,29 +297,29 @@ impl TextBuffer {
     }
 
     pub fn paste(&mut self) {
-        if self.clipboard.is_empty() {
+        let clip_text = clipboard_get();
+        if clip_text.is_empty() {
             return;
         }
-        self.delete_selection(); // remove selected text first
+        self.delete_selection();
         self.force_save_undo();
 
-        let clip = self.clipboard.clone();
+        let clip: Vec<&str> = clip_text.split('\n').collect();
         if clip.len() == 1 {
-            self.lines[self.cursor_row].insert_str(self.cursor_col, &clip[0]);
+            self.lines[self.cursor_row].insert_str(self.cursor_col, clip[0]);
             self.cursor_col += clip[0].len();
         } else {
             let rest = self.lines[self.cursor_row].split_off(self.cursor_col);
-            self.lines[self.cursor_row].push_str(&clip[0]);
+            self.lines[self.cursor_row].push_str(clip[0]);
             for (i, line) in clip[1..].iter().enumerate() {
                 self.cursor_row += 1;
                 if i == clip.len() - 2 {
-                    // Last pasted line — append rest
-                    let mut last = line.clone();
+                    let mut last = line.to_string();
                     self.cursor_col = last.len();
                     last.push_str(&rest);
                     self.lines.insert(self.cursor_row, last);
                 } else {
-                    self.lines.insert(self.cursor_row, line.clone());
+                    self.lines.insert(self.cursor_row, line.to_string());
                 }
             }
         }
