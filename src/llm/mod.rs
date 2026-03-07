@@ -53,9 +53,13 @@ impl LlmManager {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".to_string());
 
+        // Extract model name (strip provider/ prefix for API calls)
+        let model = config.model.clone();
+        let model_name = model.split('/').last().unwrap_or(&model).to_string();
+
         Self {
-            api_key: config.llm.api_key.clone(),
-            default_model: config.llm.model.clone(),
+            api_key: config.api_key(),
+            default_model: model_name,
             default_max_tokens: config.llm.max_tokens,
             cwd,
             rx,
