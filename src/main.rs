@@ -11,7 +11,6 @@ use app::App;
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers,
-        MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -78,6 +77,7 @@ async fn run_app(
                     if app.quit_confirm {
                         return Ok(());
                     } else {
+                        app.quit_unsaved_files = app.unsaved_files();
                         app.quit_confirm = true;
                         continue;
                     }

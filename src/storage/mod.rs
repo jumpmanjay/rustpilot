@@ -3,7 +3,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -146,6 +146,7 @@ impl Store {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn read_thread(&self, project: &str, thread: &str) -> Result<Vec<Message>> {
         let path = self.thread_file(project, thread);
         let mut messages = Vec::new();

@@ -4,6 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 #[derive(Debug, Clone)]
 pub enum LlmChunk {
     Text(String),
+    #[allow(dead_code)]
     ToolUse { name: String, input: String },
     Done { tokens_in: u64, tokens_out: u64 },
     Error(String),
@@ -19,6 +20,7 @@ pub struct LlmPanel {
     /// Whether we're auto-following new output
     pub following: bool,
     /// Status info
+    #[allow(dead_code)]
     pub model: String,
     pub tokens_in: u64,
     pub tokens_out: u64,

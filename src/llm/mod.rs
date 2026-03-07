@@ -4,6 +4,7 @@ use crate::config::Config;
 use crate::panels::llm::{LlmChunk, LlmPanel};
 
 pub struct LlmManager {
+    #[allow(dead_code)]
     provider: String,
     model: String,
     api_key: String,

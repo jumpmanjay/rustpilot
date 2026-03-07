@@ -13,6 +13,7 @@ pub struct Config {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct LlmConfig {
+    #[allow(dead_code)]
     #[serde(default = "default_provider")]
     pub provider: String,
     #[serde(default = "default_model")]

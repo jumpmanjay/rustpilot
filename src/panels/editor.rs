@@ -45,6 +45,7 @@ pub struct TextBuffer {
     // Undo/redo
     undo_stack: Vec<UndoEntry>,
     redo_stack: Vec<UndoEntry>,
+    #[allow(dead_code)]
     undo_batch: bool, // whether we're in a batch (e.g., typing chars)
     last_edit_kind: EditKind,
 }
@@ -711,6 +712,7 @@ impl TextBuffer {
     }
 
     /// Check if a row is within the current selection
+    #[allow(dead_code)]
     pub fn is_row_selected(&self, row: usize) -> bool {
         if let Some((sr, _, er, _)) = self.selection_range() {
             row >= sr && row <= er

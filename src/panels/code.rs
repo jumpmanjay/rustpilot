@@ -83,7 +83,9 @@ pub struct FileEntry {
     pub name: String,
     pub path: String,
     pub is_dir: bool,
+    #[allow(dead_code)]
     pub depth: usize,
+    #[allow(dead_code)]
     pub expanded: bool,
 }
 

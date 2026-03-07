@@ -1,5 +1,5 @@
 use anyhow::Result;
-use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 use crate::config::Config;
 use crate::llm::LlmManager;
@@ -8,6 +8,7 @@ use crate::storage::Store;
 
 /// Top-level application state
 pub struct App {
+    #[allow(dead_code)]
     pub config: Config,
     pub store: Store,
     pub llm: LlmManager,
@@ -21,8 +22,10 @@ pub struct App {
     pub focused: PanelId,
     pub visible: [bool; 4], // [Explorer, Editor, Llm, Prompt]
 
+    #[allow(dead_code)]
     pub should_quit: bool,
     pub quit_confirm: bool,
+    pub quit_unsaved_files: Vec<String>,
 
     /// Panel rectangles from last render (for mouse hit-testing)
     pub panel_rects: Vec<(PanelId, Rect)>,
@@ -79,6 +82,7 @@ impl App {
             visible: [true, true, true, true],
             should_quit: false,
             quit_confirm: false,
+            quit_unsaved_files: Vec::new(),
             panel_rects: Vec::new(),
             mouse_dragging: false,
             last_click: None,
@@ -135,6 +139,23 @@ impl App {
 
     pub fn poll_llm_updates(&mut self) {
         self.llm.poll_updates(&mut self.llm_panel);
+    }
+
+    pub fn unsaved_files(&self) -> Vec<String> {
+        let mut files = Vec::new();
+        // Check current buffer
+        if self.code_panel.buffer.modified {
+            if let Some(ref path) = self.code_panel.file_path {
+                files.push(path.clone());
+            }
+        }
+        // Check stashed buffers
+        for (path, buf) in &self.code_panel.open_buffers {
+            if buf.modified {
+                files.push(path.clone());
+            }
+        }
+        files
     }
 
     // ─── Overlay: File Finder (Ctrl+P) ───
@@ -403,7 +424,8 @@ impl App {
         }
     }
 
-    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+    pub fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crossterm::event::{MouseButton, MouseEventKind};
         let x = mouse.column;
         let y = mouse.row;
 

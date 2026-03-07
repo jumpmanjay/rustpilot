@@ -1,12 +1,12 @@
 use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Frame,
 };
 
-use crate::app::{App, GrepResult, Overlay};
+use crate::app::{App, Overlay};
 use crate::panels::code::{DiffLineKind, EditorMode, ScmStatus};
 use crate::panels::editor::TextBuffer;
 use crate::panels::prompt::PromptView;
@@ -23,28 +23,53 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // Quit confirmation overlay
     if app.quit_confirm {
         let area = f.area();
-        let msg = Paragraph::new(
-            "Quit RustPilot? Press Ctrl+Q again to confirm, any other key to cancel.",
-        )
-        .style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
-        .alignment(Alignment::Center)
-        .wrap(Wrap { trim: false });
+        let unsaved = &app.quit_unsaved_files;
+
+        let mut lines = Vec::new();
+        if unsaved.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "Quit RustPilot?",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                format!("⚠ {} unsaved file(s):", unsaved.len()),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )));
+            for f_path in unsaved.iter().take(8) {
+                lines.push(Line::from(Span::styled(
+                    format!("  • {}", short_path(f_path)),
+                    Style::default().fg(Color::Yellow),
+                )));
+            }
+            if unsaved.len() > 8 {
+                lines.push(Line::from(Span::styled(
+                    format!("  ... and {} more", unsaved.len() - 8),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(
+            "Ctrl+Q again to quit without saving, any other key to cancel",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        let height = (lines.len() + 2) as u16; // +2 for borders
+        let width = (area.width * 2 / 3).min(60);
         let center = Rect::new(
-            area.x + area.width / 4,
-            area.y + area.height / 2 - 1,
-            area.width / 2,
-            3,
+            area.x + (area.width.saturating_sub(width)) / 2,
+            area.y + area.height / 2 - height / 2,
+            width,
+            height,
         );
+
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Red))
             .title(" Quit? ");
         f.render_widget(Clear, center);
-        f.render_widget(msg.block(block), center);
+        f.render_widget(Paragraph::new(lines).block(block), center);
         return;
     }
 
@@ -157,7 +182,6 @@ fn draw_explorer(f: &mut Frame, app: &App, area: Rect, focused: bool) {
     f.render_widget(block, area);
 
     let height = inner.height as usize;
-    let total = app.code_panel.entries.len();
     let selected = app.code_panel.selected_idx;
 
     let scroll = if selected >= height {
@@ -311,8 +335,7 @@ fn draw_llm_panel(f: &mut Frame, app: &App, area: Rect, focused: bool) {
     f.render_widget(block, area);
 
     let height = inner.height as usize;
-    let total = panel.total_lines();
-    let end = total.saturating_sub(panel.scroll_offset);
+    let end = panel.total_lines().saturating_sub(panel.scroll_offset);
     let start = end.saturating_sub(height);
 
     let mut visible_lines: Vec<Line> = Vec::new();
@@ -538,7 +561,120 @@ fn draw_scm_explorer(f: &mut Frame, app: &App, area: Rect, focused: bool) {
     f.render_widget(List::new(items), inner);
 }
 
-// ─── Source Control Diff View ───
+// ─── Source Control Diff View (Side-by-Side) ───
+
+/// A row in the side-by-side diff
+struct SideBySideRow {
+    left_num: Option<usize>,
+    left_text: String,
+    left_kind: DiffLineKind,
+    right_num: Option<usize>,
+    right_text: String,
+    right_kind: DiffLineKind,
+}
+
+fn build_side_by_side(diff_lines: &[crate::panels::code::DiffLine]) -> Vec<SideBySideRow> {
+    let mut rows = Vec::new();
+    let mut left_num: usize = 0;
+    let mut right_num: usize = 0;
+
+    // Collect removals and additions in chunks to pair them
+    let mut i = 0;
+    while i < diff_lines.len() {
+        let dl = &diff_lines[i];
+        match dl.kind {
+            DiffLineKind::Header => {
+                // Parse @@ -a,b +c,d @@ to get line numbers
+                if dl.text.starts_with("@@") {
+                    if let Some((l, r)) = parse_hunk_header(&dl.text) {
+                        left_num = l.saturating_sub(1);
+                        right_num = r.saturating_sub(1);
+                    }
+                }
+                rows.push(SideBySideRow {
+                    left_num: None,
+                    left_text: dl.text.clone(),
+                    left_kind: DiffLineKind::Header,
+                    right_num: None,
+                    right_text: dl.text.clone(),
+                    right_kind: DiffLineKind::Header,
+                });
+                i += 1;
+            }
+            DiffLineKind::Context => {
+                left_num += 1;
+                right_num += 1;
+                let text = dl.text.get(1..).unwrap_or(&dl.text).to_string();
+                rows.push(SideBySideRow {
+                    left_num: Some(left_num),
+                    left_text: text.clone(),
+                    left_kind: DiffLineKind::Context,
+                    right_num: Some(right_num),
+                    right_text: text,
+                    right_kind: DiffLineKind::Context,
+                });
+                i += 1;
+            }
+            DiffLineKind::Removed | DiffLineKind::Added => {
+                // Collect consecutive removed and added lines
+                let mut removed = Vec::new();
+                let mut added = Vec::new();
+                while i < diff_lines.len() {
+                    match diff_lines[i].kind {
+                        DiffLineKind::Removed => {
+                            removed.push(diff_lines[i].text.get(1..).unwrap_or("").to_string());
+                            i += 1;
+                        }
+                        DiffLineKind::Added if removed.is_empty() || !added.is_empty() || {
+                            // Check if we're still in the add portion after removes
+                            let mut peek = i;
+                            while peek < diff_lines.len() && diff_lines[peek].kind == DiffLineKind::Added {
+                                peek += 1;
+                            }
+                            true
+                        } => {
+                            added.push(diff_lines[i].text.get(1..).unwrap_or("").to_string());
+                            i += 1;
+                        }
+                        _ => break,
+                    }
+                }
+
+                // Pair removed/added lines side by side
+                let max = removed.len().max(added.len());
+                for j in 0..max {
+                    let has_left = j < removed.len();
+                    let has_right = j < added.len();
+                    if has_left {
+                        left_num += 1;
+                    }
+                    if has_right {
+                        right_num += 1;
+                    }
+                    rows.push(SideBySideRow {
+                        left_num: if has_left { Some(left_num) } else { None },
+                        left_text: if has_left { removed[j].clone() } else { String::new() },
+                        left_kind: if has_left { DiffLineKind::Removed } else { DiffLineKind::Context },
+                        right_num: if has_right { Some(right_num) } else { None },
+                        right_text: if has_right { added[j].clone() } else { String::new() },
+                        right_kind: if has_right { DiffLineKind::Added } else { DiffLineKind::Context },
+                    });
+                }
+            }
+        }
+    }
+    rows
+}
+
+fn parse_hunk_header(header: &str) -> Option<(usize, usize)> {
+    // Parse "@@ -a,b +c,d @@" → (a, c)
+    let parts: Vec<&str> = header.split_whitespace().collect();
+    let left = parts.get(1)?;
+    let right = parts.get(2)?;
+    let left_start: usize = left.trim_start_matches('-').split(',').next()?.parse().ok()?;
+    let right_start: usize = right.trim_start_matches('+').split(',').next()?.parse().ok()?;
+    Some((left_start, right_start))
+}
 
 fn draw_scm_diff(f: &mut Frame, app: &App, area: Rect, focused: bool) {
     let scm = &app.code_panel.scm;
@@ -565,28 +701,61 @@ fn draw_scm_diff(f: &mut Frame, app: &App, area: Rect, focused: bool) {
         return;
     }
 
+    let sbs_rows = build_side_by_side(&scm.diff_lines);
     let height = inner.height as usize;
-    let start = scm.diff_scroll;
-    let end = (start + height).min(scm.diff_lines.len());
+    let start = scm.diff_scroll.min(sbs_rows.len().saturating_sub(1));
+    let end = (start + height).min(sbs_rows.len());
 
-    let lines: Vec<Line> = scm.diff_lines[start..end]
+    // Split into left and right halves
+    let half_width = inner.width as usize / 2;
+    let gutter = 5; // line number width
+
+    let lines: Vec<Line> = sbs_rows[start..end]
         .iter()
-        .map(|dl| {
-            let (color, bg) = match dl.kind {
-                DiffLineKind::Added => (Color::Green, None),
-                DiffLineKind::Removed => (Color::Red, None),
-                DiffLineKind::Header => (Color::Cyan, None),
-                DiffLineKind::Context => (Color::White, None),
+        .map(|row| {
+            let content_width = half_width.saturating_sub(gutter + 1); // +1 for separator
+
+            // Left side
+            let left_num_str = row.left_num.map(|n| format!("{:>4} ", n)).unwrap_or_else(|| "     ".to_string());
+            let left_text = truncate_str(&row.left_text, content_width);
+            let left_pad = content_width.saturating_sub(left_text.len());
+
+            // Right side
+            let right_num_str = row.right_num.map(|n| format!("{:>4} ", n)).unwrap_or_else(|| "     ".to_string());
+            let right_text = truncate_str(&row.right_text, content_width);
+
+            let left_style = match row.left_kind {
+                DiffLineKind::Removed => Style::default().fg(Color::Red).bg(Color::Rgb(40, 0, 0)),
+                DiffLineKind::Header => Style::default().fg(Color::Cyan),
+                _ => Style::default().fg(Color::White),
             };
-            let mut style = Style::default().fg(color);
-            if let Some(bg_color) = bg {
-                style = style.bg(bg_color);
-            }
-            Line::from(Span::styled(&dl.text, style))
+            let right_style = match row.right_kind {
+                DiffLineKind::Added => Style::default().fg(Color::Green).bg(Color::Rgb(0, 30, 0)),
+                DiffLineKind::Header => Style::default().fg(Color::Cyan),
+                _ => Style::default().fg(Color::White),
+            };
+
+            Line::from(vec![
+                Span::styled(left_num_str, Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{}{}", left_text, " ".repeat(left_pad)), left_style),
+                Span::styled("│", Style::default().fg(Color::DarkGray)),
+                Span::styled(right_num_str, Style::default().fg(Color::DarkGray)),
+                Span::styled(right_text.to_string(), right_style),
+            ])
         })
         .collect();
 
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn truncate_str(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        s
+    } else if max > 0 {
+        &s[..max]
+    } else {
+        ""
+    }
 }
 
 fn short_path(path: &str) -> &str {
