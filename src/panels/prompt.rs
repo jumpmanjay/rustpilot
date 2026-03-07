@@ -33,6 +33,9 @@ pub struct PromptPanel {
     // References queued from other panels
     pub pending_references: Vec<String>,
 
+    // Files manually saved by the user (tracked for LLM context)
+    pub changed_files: Vec<String>,
+
     // History view
     pub history_scroll: usize,
 
@@ -52,9 +55,22 @@ impl PromptPanel {
             current_thread: None,
             compose: TextBuffer::new(),
             pending_references: Vec::new(),
+            changed_files: Vec::new(),
             history_scroll: 0,
             viewport_height: 24,
         }
+    }
+
+    /// Record a file that was manually saved by the user
+    pub fn record_saved_file(&mut self, path: &str) {
+        if !self.changed_files.contains(&path.to_string()) {
+            self.changed_files.push(path.to_string());
+        }
+    }
+
+    /// Clear the changed files list (after sending a prompt)
+    pub fn clear_changed_files(&mut self) {
+        self.changed_files.clear();
     }
 
     /// Insert a reference from another panel (file path, line ref, etc.)
@@ -148,10 +164,22 @@ impl PromptPanel {
                     if let (Some(proj), Some(thread)) =
                         (&self.current_project, &self.current_thread)
                     {
-                        let resolved = crate::refs::resolve_references(&prompt_text);
-                        let _ = store.append_message(proj, thread, "user", &prompt_text);
+                        // Build the full prompt with changed files context
+                        let mut full_prompt = String::new();
+                        if !self.changed_files.is_empty() {
+                            full_prompt.push_str("Files I manually edited since last prompt:\n");
+                            for f in &self.changed_files {
+                                full_prompt.push_str(&format!("  - {}\n", f));
+                            }
+                            full_prompt.push('\n');
+                        }
+                        full_prompt.push_str(&prompt_text);
+
+                        let resolved = crate::refs::resolve_references(&full_prompt);
+                        let _ = store.append_message(proj, thread, "user", &full_prompt);
                         llm.send_prompt(&resolved);
                         self.compose.clear();
+                        self.clear_changed_files();
                     }
                 }
                 return;

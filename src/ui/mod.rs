@@ -347,20 +347,43 @@ fn draw_prompt_panel(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
     match app.prompt_panel.view {
         PromptView::Browser => draw_prompt_browser(f, app, inner),
         PromptView::Compose => {
-            let compose_area = if !app.prompt_panel.pending_references.is_empty() {
+            // Build header lines for pending refs and changed files
+            let has_refs = !app.prompt_panel.pending_references.is_empty();
+            let has_changed = !app.prompt_panel.changed_files.is_empty();
+            let header_lines = (if has_refs { 1 } else { 0 }) + (if has_changed { 1 } else { 0 });
+
+            let compose_area = if header_lines > 0 {
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(2), Constraint::Min(1)])
+                    .constraints([
+                        Constraint::Length(header_lines as u16),
+                        Constraint::Min(1),
+                    ])
                     .split(inner);
 
-                let refs_text = format!(
-                    "📎 {} pending refs (Enter thread to insert)",
-                    app.prompt_panel.pending_references.len()
-                );
-                f.render_widget(
-                    Paragraph::new(refs_text).style(Style::default().fg(Color::Yellow)),
-                    chunks[0],
-                );
+                let mut header = Vec::new();
+                if has_refs {
+                    header.push(Line::from(Span::styled(
+                        format!(
+                            "📎 {} pending refs",
+                            app.prompt_panel.pending_references.len()
+                        ),
+                        Style::default().fg(Color::Yellow),
+                    )));
+                }
+                if has_changed {
+                    let files: Vec<&str> = app
+                        .prompt_panel
+                        .changed_files
+                        .iter()
+                        .map(|f| short_path(f))
+                        .collect();
+                    header.push(Line::from(Span::styled(
+                        format!("✏️  Changed: {}", files.join(", ")),
+                        Style::default().fg(Color::Green),
+                    )));
+                }
+                f.render_widget(Paragraph::new(header), chunks[0]);
                 chunks[1]
             } else {
                 inner

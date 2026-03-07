@@ -161,7 +161,9 @@ impl CodePanel {
 
         match key.code {
             KeyCode::Char('s') if ctrl => {
-                self.save_file();
+                if let Some(path) = self.save_file() {
+                    prompt.record_saved_file(&path);
+                }
                 return;
             }
             KeyCode::Char('r') if ctrl => {
@@ -198,14 +200,15 @@ impl CodePanel {
         }
     }
 
-    fn save_file(&mut self) {
+    fn save_file(&mut self) -> Option<String> {
         if let Some(ref path) = self.file_path {
             let content = self.buffer.to_string();
             if std::fs::write(path, &content).is_ok() {
                 self.buffer.modified = false;
-                // Remove from open_buffers cache since it's now saved
                 self.open_buffers.remove(path);
+                return Some(path.clone());
             }
         }
+        None
     }
 }
