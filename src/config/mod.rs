@@ -22,6 +22,12 @@ pub struct LlmConfig {
     pub api_key: String,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
+    #[serde(default = "default_system_prompt")]
+    pub system_prompt: String,
+    #[serde(default)]
+    pub rules: Vec<String>,
+    #[serde(default = "default_max_turns")]
+    pub max_turns: usize,
 }
 
 fn default_data_dir() -> PathBuf {
@@ -39,7 +45,15 @@ fn default_model() -> String {
 }
 
 fn default_max_tokens() -> u32 {
-    8192
+    16384
+}
+
+fn default_system_prompt() -> String {
+    "You are a helpful coding assistant. You have access to tools for reading, writing, and editing files, running commands, and searching the codebase. Use them proactively to help the user.".to_string()
+}
+
+fn default_max_turns() -> usize {
+    20
 }
 
 impl Config {

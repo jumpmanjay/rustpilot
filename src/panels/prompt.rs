@@ -177,7 +177,7 @@ impl PromptPanel {
 
                         let resolved = crate::refs::resolve_references(&full_prompt);
                         let _ = store.append_message(proj, thread, "user", &full_prompt);
-                        llm.send_prompt(&resolved);
+                        let _ = llm.send_prompt(&resolved);
                         self.compose.clear();
                         self.clear_changed_files();
                     }

@@ -1,170 +1,222 @@
+pub mod agent;
+pub mod tools;
+
+use std::collections::HashMap;
 use tokio::sync::mpsc;
+
+use agent::{Agent, AgentConfig, AgentEvent, AgentId};
+use tools::ToolRegistry;
 
 use crate::config::Config;
 use crate::panels::llm::{LlmChunk, LlmPanel};
 
+/// Manages multiple parallel agent sessions
 pub struct LlmManager {
-    #[allow(dead_code)]
-    provider: String,
-    model: String,
     api_key: String,
-    max_tokens: u32,
-    /// Receiver for chunks from async streaming tasks
-    rx: mpsc::UnboundedReceiver<LlmChunk>,
-    /// Sender cloned into each streaming task
-    tx: mpsc::UnboundedSender<LlmChunk>,
+    default_model: String,
+    default_max_tokens: u32,
+    cwd: String,
+
+    /// Channel for agent events from all running agents
+    rx: mpsc::UnboundedReceiver<(AgentId, AgentEvent)>,
+    tx: mpsc::UnboundedSender<(AgentId, AgentEvent)>,
+
+    /// Active agents (kept for reference, actual work happens in spawned tasks)
+    pub agents: HashMap<AgentId, AgentInfo>,
+}
+
+/// Info about a running agent (metadata kept in main thread)
+#[derive(Debug, Clone)]
+pub struct AgentInfo {
+    pub id: AgentId,
+    #[allow(dead_code)]
+    pub name: String,
+    pub model: String,
+    pub status: AgentStatus,
+    pub total_tokens_in: u64,
+    pub total_tokens_out: u64,
+    pub total_turns: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AgentStatus {
+    Running,
+    Done,
+    Error(String),
 }
 
 impl LlmManager {
     pub fn new(config: &Config) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
+
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string());
+
         Self {
-            provider: config.llm.provider.clone(),
-            model: config.llm.model.clone(),
             api_key: config.llm.api_key.clone(),
-            max_tokens: config.llm.max_tokens,
+            default_model: config.llm.model.clone(),
+            default_max_tokens: config.llm.max_tokens,
+            cwd,
             rx,
             tx,
+            agents: HashMap::new(),
         }
     }
 
-    /// Send a prompt to the LLM — spawns an async task that streams chunks back
-    pub fn send_prompt(&self, prompt: &str) {
+    /// Spawn a new agent with default config
+    pub fn spawn_agent(&mut self, name: &str, system_prompt: &str) -> AgentId {
+        let config = AgentConfig {
+            model: self.default_model.clone(),
+            max_tokens: self.default_max_tokens,
+            system_prompt: system_prompt.to_string(),
+            ..Default::default()
+        };
+        self.spawn_agent_with_config(name, config)
+    }
+
+    /// Spawn a new agent with custom config
+    pub fn spawn_agent_with_config(&mut self, name: &str, config: AgentConfig) -> AgentId {
+        let agent = Agent::new(config.clone(), &self.cwd);
+        let agent_id = agent.id.clone();
+
+        self.agents.insert(
+            agent_id.clone(),
+            AgentInfo {
+                id: agent_id.clone(),
+                name: name.to_string(),
+                model: config.model.clone(),
+                status: AgentStatus::Running,
+                total_tokens_in: 0,
+                total_tokens_out: 0,
+                total_turns: 0,
+            },
+        );
+
+        agent_id
+    }
+
+    /// Send a message to an existing agent (or create a default one)
+    pub fn send_prompt(&mut self, prompt: &str) -> AgentId {
+        self.send_prompt_to(None, prompt)
+    }
+
+    /// Send a prompt to a specific agent, or create a new default one
+    pub fn send_prompt_to(&mut self, agent_id: Option<&str>, prompt: &str) -> AgentId {
+        let id = if let Some(id) = agent_id {
+            id.to_string()
+        } else if let Some(existing) = self.agents.values().find(|a| a.status == AgentStatus::Running || a.status == AgentStatus::Done) {
+            existing.id.clone()
+        } else {
+            self.spawn_agent("default", "You are a helpful coding assistant. You have access to tools for reading, writing, and editing files, running commands, and searching the codebase. Use them to help the user.")
+        };
+
         let api_key = self.api_key.clone();
-        let model = self.model.clone();
-        let max_tokens = self.max_tokens;
-        let prompt = prompt.to_string();
         let tx = self.tx.clone();
+        let prompt = prompt.to_string();
+        let cwd = self.cwd.clone();
+        let model = self.agents.get(&id).map(|a| a.model.clone()).unwrap_or_else(|| self.default_model.clone());
+        let max_tokens = self.default_max_tokens;
 
         if api_key.is_empty() {
-            let _ = tx.send(LlmChunk::Error(
-                "No API key configured. Set llm.api_key in ~/.rustpilot/config.toml".into(),
+            let _ = tx.send((
+                id.clone(),
+                AgentEvent::Error("No API key configured. Set llm.api_key in ~/.rustpilot/config.toml".into()),
             ));
-            return;
+            return id;
         }
 
+        // Update status
+        if let Some(info) = self.agents.get_mut(&id) {
+            info.status = AgentStatus::Running;
+        }
+
+        // Spawn the agentic loop in a background task
+        let agent_id = id.clone();
         tokio::spawn(async move {
-            let result = stream_anthropic(&api_key, &model, max_tokens, &prompt, &tx).await;
-            if let Err(e) = result {
-                let _ = tx.send(LlmChunk::Error(format!("{}", e)));
-            }
+            let config = AgentConfig {
+                model,
+                max_tokens,
+                system_prompt: "You are a helpful coding assistant. You have access to tools for reading, writing, and editing files, running commands, and searching the codebase. Use them to help the user.".into(),
+                ..Default::default()
+            };
+            let mut agent = Agent::new(config, &cwd);
+            agent.id = agent_id;
+
+            let tools = ToolRegistry::with_defaults();
+            agent.run(&prompt, &api_key, &tools, &tx).await;
         });
+
+        id
     }
 
-    /// Poll for any pending LLM stream updates (non-blocking)
+    /// Poll for updates from all running agents
     pub fn poll_updates(&mut self, panel: &mut LlmPanel) {
-        while let Ok(chunk) = self.rx.try_recv() {
-            panel.push_chunk(chunk);
-        }
-    }
-}
-
-async fn stream_anthropic(
-    api_key: &str,
-    model: &str,
-    max_tokens: u32,
-    prompt: &str,
-    tx: &mpsc::UnboundedSender<LlmChunk>,
-) -> anyhow::Result<()> {
-    let client = reqwest::Client::new();
-
-    let body = serde_json::json!({
-        "model": model,
-        "max_tokens": max_tokens,
-        "stream": true,
-        "messages": [
-            {"role": "user", "content": prompt}
-        ]
-    });
-
-    let resp = client
-        .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        let _ = tx.send(LlmChunk::Error(format!("API {}: {}", status, text)));
-        return Ok(());
-    }
-
-    use futures_util::StreamExt;
-
-    let mut stream = resp.bytes_stream();
-    let mut buffer = String::new();
-    let mut tokens_in = 0u64;
-    let mut tokens_out = 0u64;
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-        // Parse SSE events from buffer
-        while let Some(event_end) = buffer.find("\n\n") {
-            let event_str = buffer[..event_end].to_string();
-            buffer = buffer[event_end + 2..].to_string();
-
-            for line in event_str.lines() {
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if data == "[DONE]" {
-                        let _ = tx.send(LlmChunk::Done {
-                            tokens_in,
-                            tokens_out,
-                        });
-                        return Ok(());
+        while let Ok((agent_id, event)) = self.rx.try_recv() {
+            match &event {
+                AgentEvent::Text(text) => {
+                    panel.push_chunk(LlmChunk::Text(text.clone()));
+                }
+                AgentEvent::ToolCall { name, input } => {
+                    panel.push_chunk(LlmChunk::ToolUse {
+                        name: name.clone(),
+                        input: input.clone(),
+                    });
+                }
+                AgentEvent::ToolOutput {
+                    name,
+                    output,
+                    is_error,
+                } => {
+                    let prefix = if *is_error { "✗" } else { "✓" };
+                    // Show truncated output in the panel
+                    let display = if output.len() > 500 {
+                        format!("{}...({} chars)", &output[..500], output.len())
+                    } else {
+                        output.clone()
+                    };
+                    panel.push_chunk(LlmChunk::Text(format!(
+                        "\n{} {} → {}\n",
+                        prefix, name, display
+                    )));
+                }
+                AgentEvent::TurnDone {
+                    tokens_in,
+                    tokens_out,
+                    turn,
+                } => {
+                    if let Some(info) = self.agents.get_mut(&agent_id) {
+                        info.total_tokens_in += tokens_in;
+                        info.total_tokens_out += tokens_out;
+                        info.total_turns = *turn;
                     }
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                        let event_type = json["type"].as_str().unwrap_or("");
-                        match event_type {
-                            "content_block_delta" => {
-                                if let Some(text) =
-                                    json["delta"]["text"].as_str()
-                                {
-                                    let _ = tx.send(LlmChunk::Text(text.to_string()));
-                                }
-                            }
-                            "message_delta" => {
-                                if let Some(usage) = json["usage"].as_object() {
-                                    tokens_out =
-                                        usage.get("output_tokens")
-                                            .and_then(|v| v.as_u64())
-                                            .unwrap_or(0);
-                                }
-                            }
-                            "message_start" => {
-                                if let Some(usage) =
-                                    json["message"]["usage"].as_object()
-                                {
-                                    tokens_in =
-                                        usage.get("input_tokens")
-                                            .and_then(|v| v.as_u64())
-                                            .unwrap_or(0);
-                                }
-                            }
-                            "message_stop" => {
-                                let _ = tx.send(LlmChunk::Done {
-                                    tokens_in,
-                                    tokens_out,
-                                });
-                                return Ok(());
-                            }
-                            _ => {}
-                        }
+                }
+                AgentEvent::Done {
+                    total_tokens_in,
+                    total_tokens_out,
+                    total_turns,
+                } => {
+                    if let Some(info) = self.agents.get_mut(&agent_id) {
+                        info.status = AgentStatus::Done;
+                        info.total_tokens_in = *total_tokens_in;
+                        info.total_tokens_out = *total_tokens_out;
+                        info.total_turns = *total_turns;
                     }
+                    panel.push_chunk(LlmChunk::Done {
+                        tokens_in: *total_tokens_in,
+                        tokens_out: *total_tokens_out,
+                    });
+                }
+                AgentEvent::Error(msg) => {
+                    if let Some(info) = self.agents.get_mut(&agent_id) {
+                        info.status = AgentStatus::Error(msg.clone());
+                    }
+                    panel.push_chunk(LlmChunk::Error(msg.clone()));
+                }
+                AgentEvent::Thinking(text) => {
+                    panel.push_chunk(LlmChunk::Text(format!("💭 {}\n", text)));
                 }
             }
         }
     }
-
-    // Stream ended without explicit stop
-    let _ = tx.send(LlmChunk::Done {
-        tokens_in,
-        tokens_out,
-    });
-    Ok(())
 }

@@ -4,7 +4,6 @@ use crossterm::event::{KeyCode, KeyEvent};
 #[derive(Debug, Clone)]
 pub enum LlmChunk {
     Text(String),
-    #[allow(dead_code)]
     ToolUse { name: String, input: String },
     Done { tokens_in: u64, tokens_out: u64 },
     Error(String),
@@ -57,11 +56,16 @@ impl LlmPanel {
                 }
             }
             LlmChunk::ToolUse { name, input } => {
-                self.lines.push(format!("── Tool: {} ──", name));
-                for line in input.lines() {
-                    self.lines.push(format!("  {}", line));
+                self.lines.push(format!("┌─ 🔧 {} ─", name));
+                // Show compact input (first few lines)
+                let input_lines: Vec<&str> = input.lines().collect();
+                for line in input_lines.iter().take(5) {
+                    self.lines.push(format!("│ {}", line));
                 }
-                self.lines.push("──────────".into());
+                if input_lines.len() > 5 {
+                    self.lines.push(format!("│ ... ({} more lines)", input_lines.len() - 5));
+                }
+                self.lines.push("└──────────".into());
             }
             LlmChunk::Done {
                 tokens_in,
