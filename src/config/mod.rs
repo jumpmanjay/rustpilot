@@ -121,6 +121,10 @@ pub struct LlmDefaults {
     pub system_prompt: String,
     #[serde(default = "default_max_turns")]
     pub max_turns: usize,
+
+    /// Session budget limit in dollars (optional)
+    #[serde(default)]
+    pub budget: Option<f64>,
 }
 
 impl Default for LlmDefaults {
@@ -131,6 +135,7 @@ impl Default for LlmDefaults {
             max_tokens: default_max_tokens(),
             system_prompt: default_system_prompt(),
             max_turns: default_max_turns(),
+            budget: None,
         }
     }
 }
@@ -275,6 +280,7 @@ impl Config {
                 max_tokens,
                 system_prompt: default_system_prompt(),
                 max_turns: default_max_turns(),
+                budget: None,
             },
             skills: HashMap::new(),
         })

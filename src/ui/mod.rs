@@ -891,8 +891,17 @@ fn draw_minimap(f: &mut Frame, buf: &TextBuffer, area: Rect) {
 
 fn draw_llm_panel(f: &mut Frame, app: &App, area: Rect, focused: bool) {
     let panel = &app.llm_panel;
-    let status = if panel.streaming { "streaming..." } else { "idle" };
-    let title = format!(" LLM [{}] in:{} out:{} ", status, panel.tokens_in, panel.tokens_out);
+    let cost = panel.usage.total_cost();
+    let status = if panel.streaming { "⟳" } else { "●" };
+    let cost_str = if cost > 0.0 { format!(" ${:.4}", cost) } else { String::new() };
+    let title = format!(
+        " LLM {} {} in:{} out:{}{} ",
+        status,
+        panel.usage.model_name,
+        format_tokens(panel.tokens_in),
+        format_tokens(panel.tokens_out),
+        cost_str,
+    );
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -901,6 +910,12 @@ fn draw_llm_panel(f: &mut Frame, app: &App, area: Rect, focused: bool) {
 
     let inner = block.inner(area);
     f.render_widget(block, area);
+
+    // Usage monitor overlay (Ctrl+U to toggle)
+    if panel.show_usage {
+        draw_usage_monitor(f, panel, inner);
+        return;
+    }
 
     let height = inner.height as usize;
     let end = panel.total_lines().saturating_sub(panel.scroll_offset);
@@ -923,6 +938,238 @@ fn draw_llm_panel(f: &mut Frame, app: &App, area: Rect, focused: bool) {
         Paragraph::new(visible_lines).wrap(Wrap { trim: false }),
         inner,
     );
+}
+
+fn draw_usage_monitor(f: &mut Frame, panel: &crate::panels::llm::LlmPanel, area: Rect) {
+    let usage = &panel.usage;
+    let duration = usage.session_duration();
+    let mins = duration.as_secs() / 60;
+    let secs = duration.as_secs() % 60;
+    let hours = mins / 60;
+    let mins = mins % 60;
+
+    let total_in = usage.total_tokens_in();
+    let total_out = usage.total_tokens_out();
+    let cost = usage.total_cost();
+    let (rate_in, rate_out) = usage.recent_rate();
+
+    let mut lines = Vec::new();
+
+    // Header
+    lines.push(Line::from(Span::styled(
+        "╔══════════════════════════════════════╗",
+        Style::default().fg(Color::Cyan),
+    )));
+    lines.push(Line::from(Span::styled(
+        "║       📊 Usage Monitor (Ctrl+U)      ║",
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(Span::styled(
+        "╠══════════════════════════════════════╣",
+        Style::default().fg(Color::Cyan),
+    )));
+
+    // Model
+    lines.push(Line::from(vec![
+        Span::styled("║ ", Style::default().fg(Color::Cyan)),
+        Span::styled("Model: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{:<29}", usage.model_name),
+            Style::default().fg(Color::White),
+        ),
+        Span::styled("║", Style::default().fg(Color::Cyan)),
+    ]));
+
+    // Session time
+    lines.push(Line::from(vec![
+        Span::styled("║ ", Style::default().fg(Color::Cyan)),
+        Span::styled("Session: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{:<27}", format!("{}h {:02}m {:02}s", hours, mins, secs)),
+            Style::default().fg(Color::White),
+        ),
+        Span::styled("║", Style::default().fg(Color::Cyan)),
+    ]));
+
+    // API calls
+    lines.push(Line::from(vec![
+        Span::styled("║ ", Style::default().fg(Color::Cyan)),
+        Span::styled("API Calls: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{:<25}", usage.api_calls),
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::styled("║", Style::default().fg(Color::Cyan)),
+    ]));
+
+    lines.push(Line::from(Span::styled(
+        "╠══════════════════════════════════════╣",
+        Style::default().fg(Color::Cyan),
+    )));
+
+    // Tokens
+    lines.push(Line::from(vec![
+        Span::styled("║ ", Style::default().fg(Color::Cyan)),
+        Span::styled("Input tokens:  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{:<21}", format_tokens_full(total_in)),
+            Style::default().fg(Color::Green),
+        ),
+        Span::styled("║", Style::default().fg(Color::Cyan)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("║ ", Style::default().fg(Color::Cyan)),
+        Span::styled("Output tokens: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{:<21}", format_tokens_full(total_out)),
+            Style::default().fg(Color::Green),
+        ),
+        Span::styled("║", Style::default().fg(Color::Cyan)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("║ ", Style::default().fg(Color::Cyan)),
+        Span::styled("Total tokens:  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{:<21}", format_tokens_full(total_in + total_out)),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("║", Style::default().fg(Color::Cyan)),
+    ]));
+
+    lines.push(Line::from(Span::styled(
+        "╠══════════════════════════════════════╣",
+        Style::default().fg(Color::Cyan),
+    )));
+
+    // Cost
+    lines.push(Line::from(vec![
+        Span::styled("║ ", Style::default().fg(Color::Cyan)),
+        Span::styled("Session cost:  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{:<21}", format!("${:.4}", cost)),
+            if cost > 1.0 {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Yellow)
+            },
+        ),
+        Span::styled("║", Style::default().fg(Color::Cyan)),
+    ]));
+
+    // Cost per minute
+    let cpm = usage.cost_per_minute();
+    lines.push(Line::from(vec![
+        Span::styled("║ ", Style::default().fg(Color::Cyan)),
+        Span::styled("Cost/minute:   ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{:<21}", format!("${:.4}", cpm)),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled("║", Style::default().fg(Color::Cyan)),
+    ]));
+
+    // Budget
+    if let Some(remaining) = usage.budget_remaining() {
+        let pct = usage.budget_percent_used().unwrap_or(0.0);
+        let bar_width = 20;
+        let filled = (pct / 100.0 * bar_width as f64) as usize;
+        let bar: String = format!(
+            "{}{}",
+            "█".repeat(filled.min(bar_width)),
+            "░".repeat(bar_width.saturating_sub(filled)),
+        );
+        let color = if pct > 90.0 { Color::Red } else if pct > 70.0 { Color::Yellow } else { Color::Green };
+
+        lines.push(Line::from(Span::styled(
+            "╠══════════════════════════════════════╣",
+            Style::default().fg(Color::Cyan),
+        )));
+        lines.push(Line::from(vec![
+            Span::styled("║ ", Style::default().fg(Color::Cyan)),
+            Span::styled("Budget:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(bar, Style::default().fg(color)),
+            Span::styled(
+                format!(" {:.0}%", pct),
+                Style::default().fg(color),
+            ),
+            Span::styled("   ║", Style::default().fg(Color::Cyan)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("║ ", Style::default().fg(Color::Cyan)),
+            Span::styled("Remaining: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{:<25}", format!("${:.4}", remaining)),
+                Style::default().fg(if remaining < 0.0 { Color::Red } else { Color::Green }),
+            ),
+            Span::styled("║", Style::default().fg(Color::Cyan)),
+        ]));
+    }
+
+    lines.push(Line::from(Span::styled(
+        "╠══════════════════════════════════════╣",
+        Style::default().fg(Color::Cyan),
+    )));
+
+    // Rate (last 5 min)
+    lines.push(Line::from(vec![
+        Span::styled("║ ", Style::default().fg(Color::Cyan)),
+        Span::styled("Rate (5m): ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{:<25}", format!("↓{:.0}/m  ↑{:.0}/m", rate_in, rate_out)),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled("║", Style::default().fg(Color::Cyan)),
+    ]));
+
+    // Pricing
+    lines.push(Line::from(vec![
+        Span::styled("║ ", Style::default().fg(Color::Cyan)),
+        Span::styled("Pricing:   ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{:<25}", format!("${}/Mi  ${}/Mo", usage.cost_per_m_input, usage.cost_per_m_output)),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled("║", Style::default().fg(Color::Cyan)),
+    ]));
+
+    lines.push(Line::from(Span::styled(
+        "╚══════════════════════════════════════╝",
+        Style::default().fg(Color::Cyan),
+    )));
+
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        format!("{}", n)
+    }
+}
+
+fn format_tokens_full(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{} ({:.2}M)", comma_sep(n), n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{} ({:.1}K)", comma_sep(n), n as f64 / 1_000.0)
+    } else {
+        format!("{}", n)
+    }
+}
+
+fn comma_sep(n: u64) -> String {
+    let s = n.to_string();
+    let mut result = String::new();
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.insert(0, ',');
+        }
+        result.insert(0, c);
+    }
+    result
 }
 
 // ─── Prompt Panel ───

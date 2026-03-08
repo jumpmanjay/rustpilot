@@ -110,12 +110,16 @@ impl App {
         // Load projects from storage on startup
         prompt_panel.projects = store.list_projects().unwrap_or_default();
 
+        let mut llm_panel = LlmPanel::new();
+        llm_panel.usage.set_model_pricing(&config.model);
+        llm_panel.usage.budget_limit = config.llm.budget;
+
         Ok(Self {
             config,
             store,
             llm,
             code_panel: CodePanel::new(),
-            llm_panel: LlmPanel::new(),
+            llm_panel,
             prompt_panel,
             terminal_panel: TerminalPanel::new(),
             split_editor: None,
