@@ -73,12 +73,21 @@ impl TerminalPanel {
         self.running = true;
 
         std::thread::spawn(move || {
-            // Use login interactive shell so aliases (ll, etc.) work
+            // Source user's bashrc for aliases (ll, etc.) but don't use -i
+            // which causes job control issues with piped I/O.
+            // Wrap: source ~/.bashrc silently, then run the actual command.
+            let wrapped = format!(
+                "[ -f ~/.bash_aliases ] && . ~/.bash_aliases 2>/dev/null; \
+                 [ -f ~/.bashrc ] && . ~/.bashrc 2>/dev/null; \
+                 {}",
+                cmd
+            );
             match Command::new("bash")
-                .args(["-lic", &cmd])
+                .args(["-c", &wrapped])
                 .current_dir(&cwd)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
+                .env("TERM", "dumb") // prevent color escape codes from confusing things
                 .spawn()
             {
                 Ok(mut child) => {
