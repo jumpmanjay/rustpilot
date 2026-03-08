@@ -584,9 +584,72 @@ impl App {
                     return;
                 }
 
-                // Close menu if clicking elsewhere
-                if self.menu.is_some() {
+                // Menu dropdown item click
+                if let Some(ref menu) = self.menu.clone() {
+                    let items_count: usize = match menu.active_menu {
+                        0 => 6, // File
+                        1 => 6, // Edit
+                        2 => 5, // View
+                        _ => 0,
+                    };
+                    let dropdown_x: u16 = match menu.active_menu {
+                        0 => 0,
+                        1 => 7,
+                        2 => 14,
+                        _ => 0,
+                    };
+                    let dropdown_width: u16 = 30;
+                    let dropdown_top: u16 = 1; // below menu bar
+                    let dropdown_bottom = dropdown_top + items_count as u16 + 2; // +2 for borders
+
+                    if x >= dropdown_x && x < dropdown_x + dropdown_width
+                        && y > dropdown_top && y < dropdown_bottom - 1
+                    {
+                        let item_idx = (y - dropdown_top - 1) as usize; // -1 for top border
+                        let active = menu.active_menu;
+                        self.menu = None;
+                        // Dispatch menu action (same as Enter handler in main.rs)
+                        match (active, item_idx) {
+                            (0, 0) => { self.code_panel.new_file(); }
+                            (0, 1) => { self.open_file_finder(); }
+                            (0, 2) => {
+                                if let Some(ref path) = self.code_panel.file_path.clone() {
+                                    let content = self.code_panel.buffer.to_string();
+                                    if std::fs::write(path, &content).is_ok() {
+                                        self.code_panel.buffer.modified = false;
+                                    }
+                                } else {
+                                    self.save_as_input = Some(String::new());
+                                }
+                            }
+                            (0, 3) => { self.save_as_input = Some(String::new()); }
+                            (0, 4) => { self.code_panel.close_current_tab(); }
+                            (0, 5) => {
+                                self.quit_unsaved_files = self.unsaved_files();
+                                self.quit_confirm = true;
+                            }
+                            (1, 0) => { self.code_panel.buffer.undo(); }
+                            (1, 1) => { self.code_panel.buffer.redo(); }
+                            (1, 2) => { self.code_panel.buffer.copy(); }
+                            (1, 3) => { self.code_panel.buffer.cut(); }
+                            (1, 4) => { self.code_panel.buffer.paste(); }
+                            (1, 5) => { self.code_panel.buffer.select_all(); }
+                            (2, 0) => { self.toggle_panel(PanelId::Explorer); }
+                            (2, 1) => { self.toggle_panel(PanelId::Llm); }
+                            (2, 2) => { self.toggle_panel(PanelId::Prompt); }
+                            (2, 3) => { self.terminal_panel.toggle(); }
+                            (2, 4) => {
+                                self.code_panel.show_hidden = !self.code_panel.show_hidden;
+                                self.code_panel.refresh_entries();
+                            }
+                            _ => {}
+                        }
+                        return;
+                    }
+
+                    // Clicked outside dropdown — close it
                     self.menu = None;
+                    // Don't return — let the click fall through to panels
                 }
 
                 if let Some((panel_id, rect)) = panel_at {
