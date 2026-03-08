@@ -140,10 +140,16 @@ impl LlmManager {
         let history = history.to_vec();
         let global_rules = self.global_rules.clone();
 
+        // Show that we're attempting to send
+        let _ = tx.send((
+            id.clone(),
+            AgentEvent::Text(format!("\n─── Sending to {} ({} history msgs) ───\n", model, history.len())),
+        ));
+
         if api_key.is_empty() {
             let _ = tx.send((
                 id.clone(),
-                AgentEvent::Error("No API key configured. Set llm.api_key in ~/.rustpilot/config.toml".into()),
+                AgentEvent::Error("No API key configured. Set provider.anthropic.api_key in ~/.rustpilot/config.yaml or ANTHROPIC_API_KEY env var".into()),
             ));
             return id;
         }

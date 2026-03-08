@@ -274,35 +274,48 @@ impl PromptPanel {
             KeyCode::Enter if ctrl => {
                 let prompt_text = self.compose.to_string();
                 if !prompt_text.trim().is_empty() {
-                    if let (Some(proj), Some(thread)) =
-                        (&self.current_project, &self.current_thread)
-                    {
-                        // Build the full prompt with changed files context
-                        let mut full_prompt = String::new();
-                        if !self.changed_files.is_empty() {
-                            full_prompt.push_str("Files I manually edited since last prompt:\n");
-                            for f in &self.changed_files {
-                                full_prompt.push_str(&format!("  - {}\n", f));
-                            }
-                            full_prompt.push('\n');
-                        }
-                        full_prompt.push_str(&prompt_text);
-
-                        let resolved = crate::refs::resolve_references(&full_prompt);
-                        let _ = store.append_message(proj, thread, "user", &full_prompt);
-
-                        // Load conversation history for context
-                        let history = store.read_thread(proj, thread).unwrap_or_default();
-                        // Convert to (role, content) pairs, excluding the message we just appended
-                        let context: Vec<(String, String)> = history.iter()
-                            .rev().skip(1).rev() // all but last (the one we just added)
-                            .map(|m| (m.role.clone(), m.content.clone()))
-                            .collect();
-
-                        let _ = llm.send_prompt_with_history(&resolved, &context);
-                        self.compose.clear();
-                        self.clear_changed_files();
+                    // Auto-create default project/thread if none selected
+                    if self.current_project.is_none() {
+                        let proj_name = "default";
+                        let _ = store.create_project(proj_name);
+                        self.current_project = Some(proj_name.to_string());
+                        self.projects = store.list_projects().unwrap_or_default();
                     }
+                    if self.current_thread.is_none() {
+                        let proj = self.current_project.as_ref().unwrap();
+                        let thread_name = format!("thread-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"));
+                        let _ = store.create_thread(proj, &thread_name);
+                        self.current_thread = Some(thread_name);
+                        self.threads = store.list_threads(proj).unwrap_or_default();
+                    }
+
+                    let proj = self.current_project.as_ref().unwrap();
+                    let thread = self.current_thread.as_ref().unwrap();
+
+                    // Build the full prompt with changed files context
+                    let mut full_prompt = String::new();
+                    if !self.changed_files.is_empty() {
+                        full_prompt.push_str("Files I manually edited since last prompt:\n");
+                        for f in &self.changed_files {
+                            full_prompt.push_str(&format!("  - {}\n", f));
+                        }
+                        full_prompt.push('\n');
+                    }
+                    full_prompt.push_str(&prompt_text);
+
+                    let resolved = crate::refs::resolve_references(&full_prompt);
+                    let _ = store.append_message(proj, thread, "user", &full_prompt);
+
+                    // Load conversation history for context
+                    let history = store.read_thread(proj, thread).unwrap_or_default();
+                    let context: Vec<(String, String)> = history.iter()
+                        .rev().skip(1).rev()
+                        .map(|m| (m.role.clone(), m.content.clone()))
+                        .collect();
+
+                    let _ = llm.send_prompt_with_history(&resolved, &context);
+                    self.compose.clear();
+                    self.clear_changed_files();
                 }
                 return;
             }
