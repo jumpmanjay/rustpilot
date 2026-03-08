@@ -1,3 +1,5 @@
+mod syntax;
+
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -11,6 +13,12 @@ use crate::panels::code::{DiffLineKind, EditorMode, ScmStatus};
 use crate::panels::editor::TextBuffer;
 use crate::panels::prompt::PromptView;
 use crate::panels::PanelId;
+
+use self::syntax::SyntaxHighlighter;
+
+lazy_static::lazy_static! {
+    static ref HIGHLIGHTER: SyntaxHighlighter = SyntaxHighlighter::new();
+}
 
 /// Layout:
 /// ┌──────────┬─────────────────┬──────────────────┐
@@ -123,10 +131,43 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 }
             }
             "editor" => {
-                app.panel_rects.push((PanelId::Editor, chunk));
+                // Split: editor | terminal (if terminal visible)
+                let (editor_chunk, terminal_chunk) = if app.terminal_panel.visible {
+                    let v = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+                        .split(chunk);
+                    (v[0], Some(v[1]))
+                } else {
+                    (chunk, None)
+                };
+
+                // Split editor: left | right (if split active)
+                let (left_chunk, right_chunk) = if app.split_editor.is_some() {
+                    let h = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(editor_chunk);
+                    (h[0], Some(h[1]))
+                } else {
+                    (editor_chunk, None)
+                };
+
+                app.panel_rects.push((PanelId::Editor, left_chunk));
                 match app.code_panel.mode {
-                    EditorMode::Files => draw_editor(f, app, chunk, app.focused == PanelId::Editor),
-                    EditorMode::SourceControl => draw_scm_diff(f, app, chunk, app.focused == PanelId::Editor),
+                    EditorMode::Files => draw_editor(f, app, left_chunk, app.focused == PanelId::Editor),
+                    EditorMode::SourceControl => draw_scm_diff(f, app, left_chunk, app.focused == PanelId::Editor),
+                }
+
+                // Right split
+                if let Some(rc) = right_chunk {
+                    draw_split_editor(f, app, rc);
+                }
+
+                // Terminal panel
+                if let Some(tc) = terminal_chunk {
+                    app.panel_rects.push((PanelId::Terminal, tc));
+                    draw_terminal_panel(f, app, tc, app.focused == PanelId::Terminal);
                 }
             }
             "right" => {
@@ -158,6 +199,29 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // Draw overlay on top of everything
     if app.overlay.is_some() {
         draw_overlay(f, app);
+    }
+
+    // Go-to-line overlay
+    if let Some(ref input) = app.goto_line_input {
+        let area = f.area();
+        let width = 30u16;
+        let height = 3u16;
+        let popup = Rect::new(
+            area.x + (area.width.saturating_sub(width)) / 2,
+            area.y + 2,
+            width,
+            height,
+        );
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(" Go to Line (Ctrl+G) ");
+        f.render_widget(Clear, popup);
+        let text = format!(":{}", input);
+        f.render_widget(
+            Paragraph::new(text).block(block),
+            popup,
+        );
     }
 }
 
@@ -221,43 +285,182 @@ fn draw_explorer(f: &mut Frame, app: &App, area: Rect, focused: bool) {
 // ─── Editor Panel ───
 
 fn draw_editor(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
-    let path = app
-        .code_panel
-        .file_path
-        .as_deref()
-        .unwrap_or("(no file)");
-    let modified = if app.code_panel.buffer.modified {
-        " [+]"
-    } else {
-        ""
-    };
-    let pos = format!(
-        " Ln {}, Col {} ",
-        app.code_panel.buffer.cursor_row + 1,
-        app.code_panel.buffer.cursor_col + 1
-    );
-    let title = format!(" {}{} —{}", short_path(path), modified, pos);
-
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(panel_border_style(focused))
-        .title(title);
+        .border_style(panel_border_style(focused));
 
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    app.code_panel.viewport_height = inner.height as usize;
-    draw_text_buffer(f, &mut app.code_panel.buffer, inner, focused, true);
+    // Split inner into: tab bar (1) | editor | status bar (1)
+    let tab_paths = app.code_panel.open_buffer_paths();
+    let has_tabs = tab_paths.len() > 1 || app.code_panel.file_path.is_some();
+    let tab_height = if has_tabs { 1u16 } else { 0 };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(tab_height),
+            Constraint::Min(1),
+            Constraint::Length(1), // status bar
+        ])
+        .split(inner);
+
+    // ── Tab bar ──
+    if has_tabs {
+        draw_tab_bar(f, app, chunks[0]);
+    }
+
+    // ── Editor area (with optional minimap) ──
+    let editor_area = chunks[1];
+    let minimap_width: u16 = if editor_area.width > 80 { 12 } else { 0 };
+
+    let (edit_rect, minimap_rect) = if minimap_width > 0 {
+        let h = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(minimap_width),
+            ])
+            .split(editor_area);
+        (h[0], Some(h[1]))
+    } else {
+        (editor_area, None)
+    };
+
+    app.code_panel.viewport_height = edit_rect.height as usize;
+
+    let ext = app.code_panel.file_path.as_deref()
+        .and_then(|p| std::path::Path::new(p).extension())
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+
+    draw_text_buffer_highlighted(f, &mut app.code_panel.buffer, edit_rect, focused, true, ext);
+
+    // ── Minimap ──
+    if let Some(mr) = minimap_rect {
+        draw_minimap(f, &app.code_panel.buffer, mr);
+    }
+
+    // ── Status bar ──
+    draw_status_bar(f, app, chunks[2]);
+}
+
+fn draw_tab_bar(f: &mut Frame, app: &App, area: Rect) {
+    let paths = app.code_panel.open_buffer_paths();
+    let current = app.code_panel.file_path.as_deref().unwrap_or("");
+
+    let mut spans = Vec::new();
+    for path in &paths {
+        let name = std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(path);
+
+        let is_modified = if path == current {
+            app.code_panel.buffer.modified
+        } else {
+            app.code_panel.open_buffers.get(path.as_str()).map_or(false, |b| b.modified)
+        };
+
+        let label = if is_modified {
+            format!(" {}● ", name)
+        } else {
+            format!(" {} ", name)
+        };
+
+        let style = if path == current {
+            Style::default().fg(Color::White).bg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+
+        spans.push(Span::styled(label, style));
+        spans.push(Span::styled("│", Style::default().fg(Color::Rgb(60, 60, 60))));
+    }
+
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
+    let buf = &app.code_panel.buffer;
+    let path = app.code_panel.file_path.as_deref().unwrap_or("(no file)");
+
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("plain");
+
+    let lang = match ext {
+        "rs" => "Rust",
+        "ts" | "tsx" => "TypeScript",
+        "js" | "jsx" => "JavaScript",
+        "py" => "Python",
+        "go" => "Go",
+        "c" | "h" => "C",
+        "cpp" | "hpp" => "C++",
+        "java" => "Java",
+        "rb" => "Ruby",
+        "sh" | "bash" => "Shell",
+        "yaml" | "yml" => "YAML",
+        "toml" => "TOML",
+        "json" => "JSON",
+        "md" => "Markdown",
+        "html" => "HTML",
+        "css" => "CSS",
+        "sql" => "SQL",
+        "lua" => "Lua",
+        "zig" => "Zig",
+        _ => ext,
+    };
+
+    let branch = &app.code_panel.scm.branch;
+    let git_info = if branch.is_empty() {
+        String::new()
+    } else {
+        format!("  {} ", branch)
+    };
+
+    let left = format!("{}{}", git_info, if app.code_panel.buffer.modified { " [+]" } else { "" });
+    let right = format!(
+        "Ln {}, Col {}  {}  UTF-8  Spaces: 4 ",
+        buf.cursor_row + 1,
+        buf.cursor_col + 1,
+        lang,
+    );
+
+    let pad = (area.width as usize).saturating_sub(left.len() + right.len());
+
+    let line = Line::from(vec![
+        Span::styled(left, Style::default().fg(Color::White).bg(Color::Rgb(30, 30, 80))),
+        Span::styled(" ".repeat(pad), Style::default().bg(Color::Rgb(30, 30, 80))),
+        Span::styled(right, Style::default().fg(Color::White).bg(Color::Rgb(30, 30, 80))),
+    ]);
+
+    f.render_widget(Paragraph::new(line), area);
 }
 
 // ─── Shared TextBuffer rendering ───
 
+/// Plain text buffer rendering (used for prompt compose, etc.)
 fn draw_text_buffer(
     f: &mut Frame,
     buf: &mut TextBuffer,
     area: Rect,
     focused: bool,
     show_line_numbers: bool,
+) {
+    draw_text_buffer_highlighted(f, buf, area, focused, show_line_numbers, "");
+}
+
+/// Syntax-highlighted text buffer with indent guides, whitespace dots, bracket matching
+fn draw_text_buffer_highlighted(
+    f: &mut Frame,
+    buf: &mut TextBuffer,
+    area: Rect,
+    focused: bool,
+    show_line_numbers: bool,
+    ext: &str,
 ) {
     let height = area.height as usize;
     let width = area.width as usize;
@@ -268,19 +471,41 @@ fn draw_text_buffer(
     let start = buf.scroll_row;
     let end = (start + height).min(buf.lines.len());
 
+    // Get matching bracket position (if any)
+    let matching_bracket = if focused { buf.matching_bracket() } else { None };
+
+    // Get syntax-highlighted spans for the visible lines
+    let visible_lines: Vec<String> = buf.lines[start..end].to_vec();
+    let has_syntax = !ext.is_empty();
+    let highlighted = if has_syntax {
+        HIGHLIGHTER.highlight_lines(&visible_lines, ext)
+    } else {
+        Vec::new()
+    };
+
     let lines: Vec<Line> = (start..end)
-        .map(|i| {
+        .enumerate()
+        .map(|(vi, i)| {
             let content = &buf.lines[i];
             let mut spans = Vec::new();
 
+            // Line number gutter
             if show_line_numbers {
-                spans.push(Span::styled(
-                    format!("{:>4} ", i + 1),
-                    Style::default().fg(Color::DarkGray),
-                ));
+                let num_style = if i == buf.cursor_row && focused {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                spans.push(Span::styled(format!("{:>4} ", i + 1), num_style));
             }
 
+            // Indent guides: vertical bars at each indent level
+            let indent_spaces = content.chars().take_while(|c| *c == ' ').count();
+            let indent_levels = indent_spaces / 4;
+
+            // Build content with whitespace visualization
             if let Some((sel_start, sel_end)) = buf.selection_cols_for_row(i) {
+                // Selection rendering (skip syntax highlighting for selected lines)
                 let s = sel_start.min(content.len());
                 let e = sel_end.min(content.len());
                 let before = &content[..s];
@@ -288,19 +513,69 @@ fn draw_text_buffer(
                 let after = &content[e..];
 
                 if !before.is_empty() {
-                    spans.push(Span::styled(before.to_string(), Style::default().fg(Color::White)));
+                    spans.push(Span::styled(
+                        render_whitespace(before, indent_levels, gutter_width),
+                        Style::default().fg(Color::White),
+                    ));
                 }
                 if !selected.is_empty() {
                     spans.push(Span::styled(
                         selected.to_string(),
-                        Style::default().bg(Color::DarkGray).fg(Color::White),
+                        Style::default().bg(Color::Rgb(40, 60, 100)).fg(Color::White),
                     ));
                 }
                 if !after.is_empty() {
                     spans.push(Span::styled(after.to_string(), Style::default().fg(Color::White)));
                 }
+            } else if has_syntax && vi < highlighted.len() {
+                // Syntax highlighted rendering
+                let syn_spans = &highlighted[vi];
+
+                // Prepend indent guides
+                if indent_levels > 0 {
+                    let mut guide_str = String::new();
+                    for level in 0..indent_levels {
+                        let pos = level * 4;
+                        if pos < indent_spaces {
+                            guide_str.push('│');
+                            // Whitespace dots for the remaining 3 spaces
+                            for j in 1..4 {
+                                if pos + j < indent_spaces {
+                                    guide_str.push('·');
+                                }
+                            }
+                        }
+                    }
+                    spans.push(Span::styled(guide_str, Style::default().fg(Color::Rgb(60, 60, 60))));
+
+                    // Add syntax spans but skip the indent chars we already rendered
+                    let mut chars_consumed = 0;
+                    let indent_chars = indent_levels * 4;
+                    for syn_span in syn_spans {
+                        let text = syn_span.content.as_ref();
+                        if chars_consumed + text.len() <= indent_chars {
+                            chars_consumed += text.len();
+                            continue;
+                        }
+                        if chars_consumed < indent_chars {
+                            let skip = indent_chars - chars_consumed;
+                            if skip < text.len() {
+                                spans.push(Span::styled(text[skip..].to_string(), syn_span.style));
+                            }
+                            chars_consumed = indent_chars;
+                        } else {
+                            spans.push(syn_span.clone());
+                        }
+                    }
+                } else {
+                    spans.extend(syn_spans.iter().cloned());
+                }
             } else {
-                spans.push(Span::styled(content.to_string(), Style::default().fg(Color::White)));
+                // Plain rendering with indent guides and whitespace dots
+                spans.push(Span::styled(
+                    render_whitespace(content, indent_levels, gutter_width),
+                    Style::default().fg(Color::White),
+                ));
             }
 
             Line::from(spans)
@@ -308,6 +583,22 @@ fn draw_text_buffer(
         .collect();
 
     f.render_widget(Paragraph::new(lines), area);
+
+    // Render bracket matching highlight
+    if let Some((br, bc)) = matching_bracket {
+        if br >= start && br < end {
+            let y = area.y + (br - start) as u16;
+            let x = area.x + gutter_width as u16 + bc.saturating_sub(buf.scroll_col) as u16;
+            if x < area.x + area.width && y < area.y + area.height {
+                // Highlight the matching bracket
+                let _ch = buf.lines[br].as_bytes().get(bc).map(|b| *b as char).unwrap_or(' ');
+                let buf_widget = f.buffer_mut();
+                if let Some(cell) = buf_widget.cell_mut((x, y)) {
+                    cell.set_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+                }
+            }
+        }
+    }
 
     if focused {
         let cursor_y = area.y + (buf.cursor_row.saturating_sub(buf.scroll_row)) as u16;
@@ -317,6 +608,88 @@ fn draw_text_buffer(
             f.set_cursor_position((cursor_x, cursor_y));
         }
     }
+}
+
+/// Replace leading spaces with indent guide chars and dots
+fn render_whitespace(text: &str, indent_levels: usize, _gutter: usize) -> String {
+    if indent_levels == 0 {
+        return text.to_string();
+    }
+    let indent_chars = indent_levels * 4;
+    let mut result = String::new();
+    for level in 0..indent_levels {
+        let pos = level * 4;
+        if pos < text.len() {
+            result.push('│');
+            for j in 1..4 {
+                if pos + j < text.len() && pos + j < indent_chars {
+                    result.push('·');
+                } else if pos + j < text.len() {
+                    result.push(text.as_bytes()[pos + j] as char);
+                }
+            }
+        }
+    }
+    if indent_chars < text.len() {
+        result.push_str(&text[indent_chars..]);
+    }
+    result
+}
+
+// ─── Minimap ───
+
+fn draw_minimap(f: &mut Frame, buf: &TextBuffer, area: Rect) {
+    let height = area.height as usize;
+    let total_lines = buf.lines.len();
+    if total_lines == 0 || height == 0 {
+        return;
+    }
+
+    // Each minimap row represents (total_lines / height) source lines
+    let ratio = (total_lines as f64) / (height as f64);
+    let viewport_start = buf.scroll_row;
+
+    let mut lines = Vec::new();
+    for y in 0..height {
+        let source_line = (y as f64 * ratio) as usize;
+        if source_line >= total_lines {
+            lines.push(Line::from(Span::raw("")));
+            continue;
+        }
+
+        let line = &buf.lines[source_line];
+        // Compress the line into minimap width
+        let mini_width = (area.width as usize).saturating_sub(1);
+        let compressed: String = line
+            .chars()
+            .take(mini_width * 2) // sample 2x chars per minimap col
+            .enumerate()
+            .filter(|(i, _)| i % 2 == 0)
+            .map(|(_, c)| if c.is_whitespace() { ' ' } else { '▪' })
+            .take(mini_width)
+            .collect();
+
+        // Highlight viewport position
+        let in_viewport = source_line >= viewport_start
+            && source_line < viewport_start + buf.lines.len().min(height);
+
+        let style = if in_viewport {
+            Style::default()
+                .fg(Color::Rgb(100, 100, 140))
+                .bg(Color::Rgb(35, 35, 50))
+        } else {
+            Style::default().fg(Color::Rgb(60, 60, 60))
+        };
+
+        lines.push(Line::from(Span::styled(compressed, style)));
+    }
+
+    let block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(Color::Rgb(40, 40, 40)));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 // ─── LLM Panel ───
@@ -545,6 +918,78 @@ fn draw_prompt_history(f: &mut Frame, app: &App, area: Rect) {
     let visible: Vec<Line> = all_lines[start..end].to_vec();
 
     f.render_widget(Paragraph::new(visible), area);
+}
+
+// ─── Terminal Panel ───
+
+fn draw_terminal_panel(f: &mut Frame, app: &App, area: Rect, focused: bool) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(panel_border_style(focused))
+        .title(" Terminal (Ctrl+`) ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let height = inner.height as usize;
+    let total = app.terminal_panel.lines.len();
+    let scroll = app.terminal_panel.scroll_offset;
+
+    let end = total.saturating_sub(scroll);
+    let start = end.saturating_sub(height);
+
+    let lines: Vec<Line> = app.terminal_panel.lines[start..end]
+        .iter()
+        .map(|l| {
+            let style = if l.starts_with("$ ") {
+                Style::default().fg(Color::Green)
+            } else if l.starts_with("[stderr]") || l.starts_with("[error]") {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            Line::from(Span::styled(l.as_str(), style))
+        })
+        .collect();
+
+    f.render_widget(Paragraph::new(lines), inner);
+
+    // Input line at bottom
+    if focused {
+        let input_y = inner.y + inner.height.saturating_sub(1);
+        let input_line = Line::from(vec![
+            Span::styled("$ ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(app.terminal_panel.input.as_str(), Style::default().fg(Color::White)),
+        ]);
+        let input_rect = Rect::new(inner.x, input_y, inner.width, 1);
+        f.render_widget(Clear, input_rect);
+        f.render_widget(Paragraph::new(input_line), input_rect);
+
+        // Cursor
+        let cx = inner.x + 2 + app.terminal_panel.input.len() as u16;
+        if cx < inner.x + inner.width {
+            f.set_cursor_position((cx, input_y));
+        }
+    }
+}
+
+// ─── Split Editor (right pane) ───
+
+fn draw_split_editor(f: &mut Frame, app: &mut App, area: Rect) {
+    let focused = app.split_editor.as_ref().map_or(false, |s| s.focused);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(panel_border_style(focused))
+        .title(" Split ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if let Some(ref mut split) = app.split_editor {
+        let ext = std::path::Path::new(&split.file_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        draw_text_buffer_highlighted(f, &mut split.buffer, inner, focused, true, ext);
+    }
 }
 
 // ─── Helpers ───

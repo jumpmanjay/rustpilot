@@ -46,6 +46,7 @@ anyhow = "1"
 wait-timeout = "0.2"
 log = "0.4"
 cli-clipboard = "0.4.0"
+lazy_static = "1"
 
 [profile.release]
 opt-level = 3

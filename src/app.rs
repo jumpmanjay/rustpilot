@@ -3,7 +3,7 @@ use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 use crate::config::Config;
 use crate::llm::LlmManager;
-use crate::panels::{CodePanel, LlmPanel, PanelId, PromptPanel};
+use crate::panels::{CodePanel, LlmPanel, PanelId, PromptPanel, TerminalPanel};
 use crate::storage::Store;
 
 /// Top-level application state
@@ -17,6 +17,10 @@ pub struct App {
     pub code_panel: CodePanel,
     pub llm_panel: LlmPanel,
     pub prompt_panel: PromptPanel,
+    pub terminal_panel: TerminalPanel,
+
+    /// Split editor: secondary file path + buffer (side-by-side)
+    pub split_editor: Option<SplitEditor>,
 
     // Layout
     pub focused: PanelId,
@@ -37,6 +41,16 @@ pub struct App {
 
     /// Overlay mode (file finder, search, etc.)
     pub overlay: Option<Overlay>,
+
+    /// Go to line overlay
+    pub goto_line_input: Option<String>,
+}
+
+/// Side-by-side split editor state
+pub struct SplitEditor {
+    pub file_path: String,
+    pub buffer: crate::panels::editor::TextBuffer,
+    pub focused: bool, // true = right (split) is focused
 }
 
 #[derive(Debug)]
@@ -82,6 +96,8 @@ impl App {
             code_panel: CodePanel::new(),
             llm_panel: LlmPanel::new(),
             prompt_panel,
+            terminal_panel: TerminalPanel::new(),
+            split_editor: None,
             focused: PanelId::Editor,
             visible: [true, true, true, true],
             should_quit: false,
@@ -91,6 +107,7 @@ impl App {
             mouse_dragging: false,
             last_click: None,
             overlay: None,
+            goto_line_input: None,
         })
     }
 
@@ -138,6 +155,7 @@ impl App {
             }
             PanelId::Llm => self.llm_panel.handle_key(key),
             PanelId::Prompt => self.prompt_panel.handle_key(key, &mut self.llm, &mut self.store),
+            PanelId::Terminal => {},
         }
     }
 
@@ -515,6 +533,7 @@ impl App {
                             }
                         }
                         PanelId::Llm => {}
+                        PanelId::Terminal => {}
                     }
                 }
             }
@@ -561,6 +580,7 @@ impl App {
                             self.prompt_panel.compose.scroll_row =
                                 self.prompt_panel.compose.scroll_row.saturating_sub(3);
                         }
+                        _ => {}
                     }
                 }
             }
@@ -589,6 +609,7 @@ impl App {
                             self.prompt_panel.compose.scroll_row =
                                 (self.prompt_panel.compose.scroll_row + 3).min(max);
                         }
+                        _ => {}
                     }
                 }
             }

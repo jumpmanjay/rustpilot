@@ -177,6 +177,49 @@ impl CodePanel {
             self.file_path = Some(path.to_string());
             self.buffer = TextBuffer::from_string(&content);
         }
+
+        // Set comment prefix based on file extension
+        if let Some(ext) = std::path::Path::new(path).extension().and_then(|e| e.to_str()) {
+            self.buffer.set_comment_for_ext(ext);
+        }
+    }
+
+    /// Get list of all open buffer paths (for tab bar)
+    pub fn open_buffer_paths(&self) -> Vec<String> {
+        let mut paths: Vec<String> = self.open_buffers.keys().cloned().collect();
+        if let Some(ref current) = self.file_path {
+            // Current file first
+            paths.retain(|p| p != current);
+            paths.insert(0, current.clone());
+        }
+        paths
+    }
+
+    /// Switch to a specific open buffer by path
+    #[allow(dead_code)]
+    pub fn switch_to_buffer(&mut self, path: &str) {
+        if self.file_path.as_deref() == Some(path) {
+            return; // already active
+        }
+        self.open_file(path);
+    }
+
+    /// Close a buffer by path. Returns true if closed.
+    #[allow(dead_code)]
+    pub fn close_buffer(&mut self, path: &str) -> bool {
+        if self.file_path.as_deref() == Some(path) {
+            // Closing active buffer — switch to another or clear
+            let other: Option<String> = self.open_buffers.keys().next().cloned();
+            if let Some(next) = other {
+                self.open_file(&next);
+            } else {
+                self.file_path = None;
+                self.buffer = TextBuffer::new();
+            }
+            true
+        } else {
+            self.open_buffers.remove(path).is_some()
+        }
     }
 
     /// Public explorer key handler (called from App when Explorer panel is focused)

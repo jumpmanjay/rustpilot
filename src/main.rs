@@ -88,19 +88,111 @@ async fn run_app(
                     app.quit_confirm = false;
                 }
 
+                // Handle go-to-line overlay
+                if app.goto_line_input.is_some() {
+                    match key.code {
+                        KeyCode::Esc => { app.goto_line_input = None; }
+                        KeyCode::Enter => {
+                            if let Some(ref input) = app.goto_line_input {
+                                if let Ok(line) = input.parse::<usize>() {
+                                    app.code_panel.buffer.go_to_line(line);
+                                }
+                            }
+                            app.goto_line_input = None;
+                        }
+                        KeyCode::Char(c) if c.is_ascii_digit() => {
+                            if let Some(ref mut input) = app.goto_line_input {
+                                input.push(c);
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            if let Some(ref mut input) = app.goto_line_input {
+                                input.pop();
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 // Handle overlay input (file finder, search, etc.)
                 if app.overlay.is_some() {
                     app.handle_overlay_key(key);
                     continue;
                 }
 
-                // Global: Ctrl+P file finder, Ctrl+F find in file, Ctrl+Shift+F find in workspace, Ctrl+G source control
+                // Terminal focus: when terminal is focused, send keys to it
+                if app.focused == panels::PanelId::Terminal {
+                    match key.code {
+                        KeyCode::Esc => {
+                            app.focused = panels::PanelId::Editor;
+                        }
+                        KeyCode::Char('`') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.terminal_panel.toggle();
+                            if !app.terminal_panel.visible {
+                                app.focused = panels::PanelId::Editor;
+                            }
+                        }
+                        KeyCode::Char(c) => {
+                            app.terminal_panel.handle_input_char(c);
+                        }
+                        KeyCode::Backspace => {
+                            app.terminal_panel.handle_backspace();
+                        }
+                        KeyCode::Enter => {
+                            let cwd = app.code_panel.cwd.clone();
+                            app.terminal_panel.handle_enter(&cwd);
+                        }
+                        KeyCode::Up => { app.terminal_panel.scroll_up(1); }
+                        KeyCode::Down => { app.terminal_panel.scroll_down(1); }
+                        KeyCode::PageUp => { app.terminal_panel.scroll_up(10); }
+                        KeyCode::PageDown => { app.terminal_panel.scroll_down(10); }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                // Global: Ctrl+P file finder, Ctrl+F find, Ctrl+Shift+F workspace search, Ctrl+G go-to-line/SCM
                 if key.modifiers.contains(KeyModifiers::CONTROL) {
                     match key.code {
                         KeyCode::Char('p') => { app.open_file_finder(); continue; }
                         KeyCode::Char('f') => { app.open_find_in_file(); continue; }
                         KeyCode::Char('F') => { app.open_find_in_workspace(); continue; }
-                        KeyCode::Char('g') => { app.code_panel.toggle_mode(); continue; }
+                        KeyCode::Char('g') => {
+                            // Ctrl+G: go to line (when editor focused) or toggle SCM
+                            if app.focused == panels::PanelId::Editor {
+                                app.goto_line_input = Some(String::new());
+                            } else {
+                                app.code_panel.toggle_mode();
+                            }
+                            continue;
+                        }
+                        KeyCode::Char('`') => {
+                            // Ctrl+`: toggle terminal
+                            app.terminal_panel.toggle();
+                            if app.terminal_panel.visible {
+                                app.focused = panels::PanelId::Terminal;
+                            } else if app.focused == panels::PanelId::Terminal {
+                                app.focused = panels::PanelId::Editor;
+                            }
+                            continue;
+                        }
+                        KeyCode::Char('\\') => {
+                            // Ctrl+\: split editor
+                            if app.split_editor.is_some() {
+                                app.split_editor = None;
+                            } else if let Some(ref path) = app.code_panel.file_path {
+                                let buf = crate::panels::editor::TextBuffer::from_string(
+                                    &app.code_panel.buffer.to_string(),
+                                );
+                                app.split_editor = Some(app::SplitEditor {
+                                    file_path: path.clone(),
+                                    buffer: buf,
+                                    focused: false,
+                                });
+                            }
+                            continue;
+                        }
                         _ => {}
                     }
                 }
