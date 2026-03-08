@@ -84,7 +84,8 @@ impl PromptPanel {
     /// Insert a reference from another panel (file path, line ref, etc.)
     /// Handle a mouse click at a local y position in the browser view
     pub fn handle_browser_click(&mut self, _x: u16, y: u16, store: &mut Store) {
-        let idx = y as usize;
+        // Offset by 1 for the header/title line in the List widget
+        let idx = if y > 0 { y as usize - 1 } else { return };
         if self.current_project.is_none() {
             // Clicking on project list
             if idx < self.projects.len() {

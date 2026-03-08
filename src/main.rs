@@ -270,9 +270,13 @@ async fn run_app(
                             }
                         }
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.terminal_panel.kill_running();
+                            // Send Ctrl+C to PTY, don't kill the app
+                            app.terminal_panel.send_ctrl_c();
                         }
-                        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.terminal_panel.send_ctrl_d();
+                        }
+                        KeyCode::Char(c) => {
                             app.terminal_panel.handle_input_char(c);
                         }
                         KeyCode::Backspace => {
