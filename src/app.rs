@@ -558,6 +558,33 @@ impl App {
 
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                // Menu bar click (row 0)
+                if y == 0 {
+                    let menu_idx = if x < 7 { 0 }       // "  File "
+                        else if x < 14 { 1 }             // " Edit "
+                        else if x < 21 { 2 }             // " View "
+                        else { usize::MAX };
+                    if menu_idx < 3 {
+                        if self.menu.as_ref().map_or(false, |m| m.active_menu == menu_idx) {
+                            self.menu = None; // toggle off
+                        } else {
+                            self.menu = Some(MenuState {
+                                active_menu: menu_idx,
+                                selected_item: 0,
+                                open: true,
+                            });
+                        }
+                    } else {
+                        self.menu = None;
+                    }
+                    return;
+                }
+
+                // Close menu if clicking elsewhere
+                if self.menu.is_some() {
+                    self.menu = None;
+                }
+
                 if let Some((panel_id, rect)) = panel_at {
                     self.focused = panel_id;
                     self.mouse_dragging = true;

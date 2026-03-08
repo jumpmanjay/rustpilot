@@ -653,6 +653,8 @@ fn draw_text_buffer_highlighted(
         Vec::new()
     };
 
+    let scroll_col = buf.scroll_col;
+
     let lines: Vec<Line> = (start..end)
         .enumerate()
         .map(|(vi, i)| {
@@ -746,6 +748,29 @@ fn draw_text_buffer_highlighted(
                     render_whitespace(content, indent_levels, gutter_width),
                     Style::default().fg(Color::White),
                 ));
+            }
+
+            // Apply horizontal scroll: trim scroll_col chars from content spans
+            // (gutter span is always first if show_line_numbers)
+            if scroll_col > 0 {
+                let gutter_spans = if show_line_numbers { 1 } else { 0 };
+                let mut chars_to_skip = scroll_col;
+                let mut new_spans: Vec<Span> = spans[..gutter_spans].to_vec();
+
+                for span in &spans[gutter_spans..] {
+                    let text = span.content.as_ref();
+                    if chars_to_skip >= text.len() {
+                        chars_to_skip -= text.len();
+                        continue;
+                    }
+                    if chars_to_skip > 0 {
+                        new_spans.push(Span::styled(text[chars_to_skip..].to_string(), span.style));
+                        chars_to_skip = 0;
+                    } else {
+                        new_spans.push(span.clone());
+                    }
+                }
+                spans = new_spans;
             }
 
             Line::from(spans)

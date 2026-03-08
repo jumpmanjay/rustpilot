@@ -216,13 +216,20 @@ impl CodePanel {
     #[allow(dead_code)]
     pub fn close_buffer(&mut self, path: &str) -> bool {
         if self.file_path.as_deref() == Some(path) {
-            // Closing active buffer — switch to another or clear
+            // Closing active buffer — clear it first so open_file doesn't re-stash it
+            self.file_path = None;
+            self.buffer = TextBuffer::new();
+
+            // Switch to another open buffer if available
             let other: Option<String> = self.open_buffers.keys().next().cloned();
             if let Some(next) = other {
-                self.open_file(&next);
-            } else {
-                self.file_path = None;
-                self.buffer = TextBuffer::new();
+                if let Some(buf) = self.open_buffers.remove(&next) {
+                    self.file_path = Some(next.clone());
+                    self.buffer = buf;
+                    if let Some(ext) = std::path::Path::new(&next).extension().and_then(|e| e.to_str()) {
+                        self.buffer.set_comment_for_ext(ext);
+                    }
+                }
             }
             true
         } else {
