@@ -37,6 +37,23 @@ pub struct CodePanel {
 
     /// Tab scroll offset (for when many tabs are open)
     pub tab_scroll: usize,
+
+    /// Explorer naming overlay (rename, new file, new folder)
+    pub explorer_naming: Option<ExplorerNaming>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExplorerNaming {
+    pub input: String,
+    pub kind: ExplorerNamingKind,
+    pub original_path: Option<String>, // for rename
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExplorerNamingKind {
+    Rename,
+    NewFile,
+    NewFolder,
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +140,7 @@ impl CodePanel {
             viewport_height: 24,
             show_hidden: true,
             tab_scroll: 0,
+            explorer_naming: None,
         };
         panel.refresh_entries();
         panel
@@ -288,6 +306,64 @@ impl CodePanel {
 
     /// Public explorer key handler (called from App when Explorer panel is focused)
     pub fn handle_explorer_key_pub(&mut self, key: KeyEvent, prompt: &mut PromptPanel) {
+        // Handle naming overlay
+        if let Some(ref mut naming) = self.explorer_naming.clone() {
+            match key.code {
+                KeyCode::Esc => { self.explorer_naming = None; }
+                KeyCode::Enter => {
+                    let name = naming.input.trim().to_string();
+                    if !name.is_empty() {
+                        match naming.kind {
+                            ExplorerNamingKind::Rename => {
+                                if let Some(ref old_path) = naming.original_path {
+                                    let parent = std::path::Path::new(old_path)
+                                        .parent()
+                                        .unwrap_or(std::path::Path::new("."));
+                                    let new_path = parent.join(&name);
+                                    let _ = std::fs::rename(old_path, &new_path);
+                                    // Update open buffer references
+                                    let old = old_path.clone();
+                                    let new_str = new_path.to_string_lossy().to_string();
+                                    if self.file_path.as_deref() == Some(&old) {
+                                        self.file_path = Some(new_str.clone());
+                                    }
+                                    if let Some(buf) = self.open_buffers.remove(&old) {
+                                        self.open_buffers.insert(new_str, buf);
+                                    }
+                                }
+                            }
+                            ExplorerNamingKind::NewFile => {
+                                let path = format!("{}/{}", self.cwd, name);
+                                if let Some(parent) = std::path::Path::new(&path).parent() {
+                                    let _ = std::fs::create_dir_all(parent);
+                                }
+                                let _ = std::fs::File::create(&path);
+                                self.open_file(&path);
+                            }
+                            ExplorerNamingKind::NewFolder => {
+                                let path = format!("{}/{}", self.cwd, name);
+                                let _ = std::fs::create_dir_all(&path);
+                            }
+                        }
+                        self.refresh_entries();
+                    }
+                    self.explorer_naming = None;
+                }
+                KeyCode::Char(c) => {
+                    if let Some(ref mut n) = self.explorer_naming {
+                        n.input.push(c);
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(ref mut n) = self.explorer_naming {
+                        n.input.pop();
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.selected_idx > 0 {
@@ -325,6 +401,48 @@ impl CodePanel {
             KeyCode::Char('R') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(entry) = self.entries.get(self.selected_idx) {
                     prompt.insert_reference(&format!("@@{}", entry.path), true);
+                }
+            }
+            // F2: rename selected entry
+            KeyCode::F(2) => {
+                if let Some(entry) = self.entries.get(self.selected_idx) {
+                    if entry.name != ".." {
+                        self.explorer_naming = Some(ExplorerNaming {
+                            input: entry.name.clone(),
+                            kind: ExplorerNamingKind::Rename,
+                            original_path: Some(entry.path.clone()),
+                        });
+                    }
+                }
+            }
+            // Ctrl+N: new file in current directory
+            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.explorer_naming = Some(ExplorerNaming {
+                    input: String::new(),
+                    kind: ExplorerNamingKind::NewFile,
+                    original_path: None,
+                });
+            }
+            // Ctrl+Shift+N: new folder
+            KeyCode::Char('N') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.explorer_naming = Some(ExplorerNaming {
+                    input: String::new(),
+                    kind: ExplorerNamingKind::NewFolder,
+                    original_path: None,
+                });
+            }
+            // Delete: delete selected entry (with safety — only empty dirs)
+            KeyCode::Delete => {
+                if let Some(entry) = self.entries.get(self.selected_idx) {
+                    if entry.name != ".." {
+                        if entry.is_dir {
+                            // Only delete empty directories
+                            let _ = std::fs::remove_dir(&entry.path);
+                        } else {
+                            let _ = std::fs::remove_file(&entry.path);
+                        }
+                        self.refresh_entries();
+                    }
                 }
             }
             _ => {}

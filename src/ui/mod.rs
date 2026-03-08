@@ -428,6 +428,33 @@ fn draw_explorer(f: &mut Frame, app: &App, area: Rect, focused: bool) {
         .collect();
 
     f.render_widget(List::new(items), inner);
+
+    // Explorer naming overlay (rename, new file, new folder)
+    if let Some(ref naming) = app.code_panel.explorer_naming {
+        use crate::panels::code::ExplorerNamingKind;
+        let title = match naming.kind {
+            ExplorerNamingKind::Rename => " Rename (F2) ",
+            ExplorerNamingKind::NewFile => " New File (Ctrl+N) ",
+            ExplorerNamingKind::NewFolder => " New Folder (Ctrl+Shift+N) ",
+        };
+        let width = inner.width.min(28);
+        let height = 3u16;
+        let popup = Rect::new(
+            inner.x + (inner.width.saturating_sub(width)) / 2,
+            inner.y + inner.height / 2 - 1,
+            width,
+            height,
+        );
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(title);
+        f.render_widget(Clear, popup);
+        f.render_widget(
+            Paragraph::new(naming.input.as_str()).block(block),
+            popup,
+        );
+    }
 }
 
 // ─── Editor Panel ───
