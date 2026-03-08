@@ -1264,7 +1264,7 @@ fn draw_prompt_browser(f: &mut Frame, app: &App, area: Rect) {
         let header = if items.is_empty() {
             "No projects. Press Ctrl+N to create one."
         } else {
-            "Projects (Enter to select, Ctrl+N for new)"
+            "Projects (Enter, Ctrl+N new, F2 rename)"
         };
 
         f.render_widget(
@@ -1291,7 +1291,7 @@ fn draw_prompt_browser(f: &mut Frame, app: &App, area: Rect) {
             .collect();
 
         let header = format!(
-            "{} — Threads (Enter, Backspace, Ctrl+N)",
+            "{} — Threads (Enter, Bksp, Ctrl+N, F2)",
             panel.current_project.as_deref().unwrap_or("")
         );
 
@@ -1307,7 +1307,11 @@ fn draw_prompt_browser(f: &mut Frame, app: &App, area: Rect) {
 
     // Naming overlay
     if let Some(ref input) = app.prompt_panel.naming_input {
-        let title = format!(" New {} ", app.prompt_panel.naming_what);
+        let title = match app.prompt_panel.naming_what.as_str() {
+            "rename-project" => " Rename Project (F2) ".to_string(),
+            "rename-thread" => " Rename Thread (F2) ".to_string(),
+            other => format!(" New {} (Ctrl+N) ", other),
+        };
         let width = 30u16.min(area.width);
         let height = 3u16;
         let popup = Rect::new(

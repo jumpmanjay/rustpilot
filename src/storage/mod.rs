@@ -108,6 +108,31 @@ impl Store {
         Ok(threads)
     }
 
+    pub fn rename_project(&self, old_name: &str, new_name: &str) -> Result<()> {
+        let old_dir = self.project_dir(old_name);
+        let new_dir = self.project_dir(new_name);
+        fs::rename(&old_dir, &new_dir)?;
+        // Update project.json
+        let meta_path = new_dir.join("project.json");
+        if meta_path.exists() {
+            if let Ok(content) = fs::read_to_string(&meta_path) {
+                if let Ok(mut meta) = serde_json::from_str::<ProjectMeta>(&content) {
+                    meta.name = new_name.to_string();
+                    let _ = fs::write(&meta_path, serde_json::to_string(&meta)?);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn rename_thread(&self, project: &str, old_name: &str, new_name: &str) -> Result<()> {
+        let dir = self.threads_dir(project);
+        let old_path = dir.join(format!("{}.jsonl", old_name));
+        let new_path = dir.join(format!("{}.jsonl", new_name));
+        fs::rename(old_path, new_path)?;
+        Ok(())
+    }
+
     pub fn create_thread(&self, project: &str, name: &str) -> Result<()> {
         let dir = self.threads_dir(project);
         fs::create_dir_all(&dir)?;

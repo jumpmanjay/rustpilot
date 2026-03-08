@@ -135,12 +135,40 @@ impl PromptPanel {
                 KeyCode::Enter => {
                     if let Some(ref name) = self.naming_input.clone() {
                         if !name.is_empty() {
-                            if self.naming_what == "project" {
-                                let _ = store.create_project(name);
-                                self.projects = store.list_projects().unwrap_or_default();
-                            } else if let Some(ref proj) = self.current_project {
-                                let _ = store.create_thread(proj, name);
-                                self.threads = store.list_threads(proj).unwrap_or_default();
+                            match self.naming_what.as_str() {
+                                "project" => {
+                                    let _ = store.create_project(name);
+                                    self.projects = store.list_projects().unwrap_or_default();
+                                }
+                                "thread" => {
+                                    if let Some(ref proj) = self.current_project {
+                                        let _ = store.create_thread(proj, name);
+                                        self.threads = store.list_threads(proj).unwrap_or_default();
+                                    }
+                                }
+                                "rename-project" => {
+                                    if let Some(old_name) = self.projects.get(self.selected_project).cloned() {
+                                        if *name != old_name {
+                                            let _ = store.rename_project(&old_name, name);
+                                            self.projects = store.list_projects().unwrap_or_default();
+                                        }
+                                    }
+                                }
+                                "rename-thread" => {
+                                    if let Some(ref proj) = self.current_project {
+                                        if let Some(old_name) = self.threads.get(self.selected_thread).cloned() {
+                                            if *name != old_name {
+                                                let _ = store.rename_thread(proj, &old_name, name);
+                                                self.threads = store.list_threads(proj).unwrap_or_default();
+                                                // Update current_thread if we renamed the active one
+                                                if self.current_thread.as_deref() == Some(&old_name) {
+                                                    self.current_thread = Some(name.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -216,6 +244,22 @@ impl PromptPanel {
                 } else {
                     "thread".to_string()
                 };
+            }
+            // F2: rename selected project or thread
+            KeyCode::F(2) => {
+                if self.current_project.is_none() {
+                    // Rename project
+                    if let Some(name) = self.projects.get(self.selected_project) {
+                        self.naming_input = Some(name.clone());
+                        self.naming_what = "rename-project".to_string();
+                    }
+                } else {
+                    // Rename thread
+                    if let Some(name) = self.threads.get(self.selected_thread) {
+                        self.naming_input = Some(name.clone());
+                        self.naming_what = "rename-thread".to_string();
+                    }
+                }
             }
             _ => {}
         }
