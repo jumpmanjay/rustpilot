@@ -17,7 +17,7 @@ impl SyntaxHighlighter {
         Self {
             syntax_set: SyntaxSet::load_defaults_newlines(),
             theme_set: ThemeSet::load_defaults(),
-            theme_name: "Monokai Extended".to_string(),
+            theme_name: "base16-mocha.dark".to_string(),
         }
     }
 
@@ -33,7 +33,9 @@ impl SyntaxHighlighter {
             .find_syntax_by_extension(extension)
             .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text());
 
-        let theme = &self.theme_set.themes[&self.theme_name];
+        let theme = self.theme_set.themes.get(&self.theme_name)
+            .or_else(|| self.theme_set.themes.values().next())
+            .expect("no themes available");
         let mut highlighter = HighlightLines::new(syntax, theme);
         let mut result = Vec::with_capacity(lines.len());
 
