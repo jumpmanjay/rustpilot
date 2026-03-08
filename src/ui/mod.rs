@@ -1448,10 +1448,15 @@ fn draw_prompt_history(f: &mut Frame, app: &App, area: Rect) {
 // ─── Terminal Panel ───
 
 fn draw_terminal_panel(f: &mut Frame, app: &App, area: Rect, focused: bool) {
+    let title = if app.terminal_panel.running {
+        " Terminal ⟳ running (Ctrl+C to kill) "
+    } else {
+        " Terminal (Ctrl+`) "
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(panel_border_style(focused))
-        .title(" Terminal (Ctrl+`) ");
+        .title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
 

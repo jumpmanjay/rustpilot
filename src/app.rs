@@ -723,9 +723,10 @@ impl App {
                     KeyCode::Tab => {
                         *editing_replace = !*editing_replace;
                     }
-                    // Ctrl+Shift+1: replace current match
+                    // Ctrl+H: replace current match
                     KeyCode::Char('h') if ctrl => {
                         if let Some(&(row, col)) = matches.get(*current) {
+                            self.code_panel.buffer.force_save_undo();
                             let line = &mut self.code_panel.buffer.lines[row];
                             let end = (col + query.len()).min(line.len());
                             line.replace_range(col..end, replace);
@@ -736,6 +737,7 @@ impl App {
                     }
                     // Ctrl+Alt+Enter: replace all
                     KeyCode::Enter if ctrl && alt => {
+                        self.code_panel.buffer.force_save_undo();
                         // Replace all matches (from bottom to top to preserve positions)
                         let mut sorted = matches.clone();
                         sorted.reverse();

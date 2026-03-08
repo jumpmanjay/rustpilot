@@ -44,6 +44,7 @@ grep-matcher = "0.1"    # ripgrep's matcher trait
 regex = "1"             # for regex::escape in fixed_strings mode
 anyhow = "1"
 wait-timeout = "0.2"
+libc = "0.2"
 log = "0.4"
 cli-clipboard = "0.4.0"
 lazy_static = "1"

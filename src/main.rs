@@ -269,7 +269,10 @@ async fn run_app(
                                 app.focused = panels::PanelId::Editor;
                             }
                         }
-                        KeyCode::Char(c) => {
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.terminal_panel.kill_running();
+                        }
+                        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                             app.terminal_panel.handle_input_char(c);
                         }
                         KeyCode::Backspace => {
@@ -279,8 +282,20 @@ async fn run_app(
                             let cwd = app.code_panel.cwd.clone();
                             app.terminal_panel.handle_enter(&cwd);
                         }
-                        KeyCode::Up => { app.terminal_panel.scroll_up(1); }
-                        KeyCode::Down => { app.terminal_panel.scroll_down(1); }
+                        KeyCode::Up => {
+                            if app.terminal_panel.input.is_empty() || app.terminal_panel.history_idx.is_some() {
+                                app.terminal_panel.history_up();
+                            } else {
+                                app.terminal_panel.scroll_up(1);
+                            }
+                        }
+                        KeyCode::Down => {
+                            if app.terminal_panel.history_idx.is_some() {
+                                app.terminal_panel.history_down();
+                            } else {
+                                app.terminal_panel.scroll_down(1);
+                            }
+                        }
                         KeyCode::PageUp => { app.terminal_panel.scroll_up(10); }
                         KeyCode::PageDown => { app.terminal_panel.scroll_down(10); }
                         _ => {}
@@ -428,5 +443,10 @@ async fn run_app(
 
         // Auto-save
         app.auto_save();
+
+        // Poll terminal for background command output
+        if app.terminal_panel.visible {
+            app.terminal_panel.poll();
+        }
     }
 }

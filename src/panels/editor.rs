@@ -132,7 +132,7 @@ impl TextBuffer {
         self.redo_stack.clear();
     }
 
-    fn force_save_undo(&mut self) {
+    pub fn force_save_undo(&mut self) {
         self.undo_stack.push(UndoEntry {
             lines: self.lines.clone(),
             cursor_row: self.cursor_row,
