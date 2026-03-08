@@ -62,7 +62,10 @@ async fn run_app(
             // Handle mouse events
             if let Event::Mouse(mouse) = ev {
                 if app.quit_confirm {
-                    app.quit_confirm = false;
+                    // Only dismiss quit dialog on a new click, not mouse-up/move
+                    if matches!(mouse.kind, crossterm::event::MouseEventKind::Down(_)) {
+                        app.quit_confirm = false;
+                    }
                     continue;
                 }
                 app.handle_mouse(mouse);
