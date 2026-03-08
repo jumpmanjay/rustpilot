@@ -31,6 +31,12 @@ pub struct CodePanel {
 
     // Viewport size (set during render)
     pub viewport_height: usize,
+
+    /// Show hidden (dot) files in explorer
+    pub show_hidden: bool,
+
+    /// Tab scroll offset (for when many tabs are open)
+    pub tab_scroll: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +121,8 @@ impl CodePanel {
                 untracked: 0,
             },
             viewport_height: 24,
+            show_hidden: true,
+            tab_scroll: 0,
         };
         panel.refresh_entries();
         panel
@@ -138,8 +146,8 @@ impl CodePanel {
             let mut items: Vec<_> = rd
                 .filter_map(|e| e.ok())
                 .filter(|e| {
-                    // Hide dotfiles by default
-                    !e.file_name().to_string_lossy().starts_with('.')
+                    // Show/hide dotfiles based on setting
+                    self.show_hidden || !e.file_name().to_string_lossy().starts_with('.')
                 })
                 .map(|e| {
                     let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
@@ -219,6 +227,55 @@ impl CodePanel {
             true
         } else {
             self.open_buffers.remove(path).is_some()
+        }
+    }
+
+    /// Create a new untitled buffer
+    pub fn new_file(&mut self) {
+        // Stash current buffer
+        if let Some(ref current_path) = self.file_path {
+            let current_path = current_path.clone();
+            let current_buf = std::mem::replace(&mut self.buffer, TextBuffer::new());
+            self.open_buffers.insert(current_path, current_buf);
+        }
+        self.file_path = None;
+        self.buffer = TextBuffer::new();
+        self.buffer.modified = true;
+    }
+
+    /// Close the current tab. Returns true if closed.
+    pub fn close_current_tab(&mut self) -> bool {
+        if let Some(ref path) = self.file_path.clone() {
+            self.close_buffer(path)
+        } else {
+            // Untitled buffer — switch to next open buffer or clear
+            let other: Option<String> = self.open_buffers.keys().next().cloned();
+            if let Some(next) = other {
+                self.open_file(&next);
+            } else {
+                self.buffer = TextBuffer::new();
+            }
+            true
+        }
+    }
+
+    /// Save current buffer to a specific path (Save As)
+    pub fn save_file_as(&mut self, path: &str) -> bool {
+        let content = self.buffer.to_string();
+        if std::fs::write(path, &content).is_ok() {
+            // Remove from old path if it existed
+            if let Some(ref old_path) = self.file_path {
+                self.open_buffers.remove(old_path);
+            }
+            self.file_path = Some(path.to_string());
+            self.buffer.modified = false;
+            // Set comment prefix for new extension
+            if let Some(ext) = std::path::Path::new(path).extension().and_then(|e| e.to_str()) {
+                self.buffer.set_comment_for_ext(ext);
+            }
+            true
+        } else {
+            false
         }
     }
 

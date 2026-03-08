@@ -656,12 +656,14 @@ impl TextBuffer {
         if self.cursor_row >= self.scroll_row + viewport_height {
             self.scroll_row = self.cursor_row - viewport_height + 1;
         }
-        // Horizontal (account for gutter)
+        // Horizontal: scroll when cursor moves beyond visible area
+        // Account for line number gutter (5 chars)
+        let effective_width = viewport_width.saturating_sub(6); // gutter + margin
         if self.cursor_col < self.scroll_col {
             self.scroll_col = self.cursor_col;
         }
-        if viewport_width > 4 && self.cursor_col >= self.scroll_col + viewport_width - 4 {
-            self.scroll_col = self.cursor_col - viewport_width + 5;
+        if effective_width > 0 && self.cursor_col >= self.scroll_col + effective_width {
+            self.scroll_col = self.cursor_col - effective_width + 1;
         }
     }
 

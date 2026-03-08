@@ -40,6 +40,10 @@ pub struct PromptPanel {
     pub history_messages: Vec<StorageMessage>,
     pub history_scroll: usize,
 
+    // Naming overlay (for new project/thread)
+    pub naming_input: Option<String>,
+    pub naming_what: String, // "project" or "thread"
+
     // Viewport size (set during render)
     pub viewport_height: usize,
 }
@@ -59,6 +63,8 @@ impl PromptPanel {
             changed_files: Vec::new(),
             history_messages: Vec::new(),
             history_scroll: 0,
+            naming_input: None,
+            naming_what: String::new(),
             viewport_height: 24,
         }
     }
@@ -76,9 +82,38 @@ impl PromptPanel {
     }
 
     /// Insert a reference from another panel (file path, line ref, etc.)
+    /// Handle a mouse click at a local y position in the browser view
+    pub fn handle_browser_click(&mut self, _x: u16, y: u16, store: &mut Store) {
+        let idx = y as usize;
+        if self.current_project.is_none() {
+            // Clicking on project list
+            if idx < self.projects.len() {
+                self.selected_project = idx;
+                let proj = self.projects[idx].clone();
+                self.current_project = Some(proj.clone());
+                self.threads = store.list_threads(&proj).unwrap_or_default();
+                self.selected_thread = 0;
+            }
+        } else {
+            // Clicking on thread list
+            if idx < self.threads.len() {
+                self.selected_thread = idx;
+                let thread = self.threads[idx].clone();
+                self.current_thread = Some(thread);
+                self.view = PromptView::Compose;
+                self.compose.clear();
+                for r in self.pending_references.drain(..) {
+                    self.compose.insert_str(&r);
+                    self.compose.insert_newline();
+                }
+            }
+        }
+    }
+
     pub fn insert_reference(&mut self, reference: &str, _is_include: bool) {
         if self.view == PromptView::Compose {
             self.compose.insert_str(reference);
+            self.compose.insert_newline(); // newline after reference
         } else {
             self.pending_references.push(reference.to_string());
         }
@@ -93,6 +128,39 @@ impl PromptPanel {
     }
 
     fn handle_browser_key(&mut self, key: KeyEvent, store: &mut Store) {
+        // Naming overlay
+        if self.naming_input.is_some() {
+            match key.code {
+                KeyCode::Esc => { self.naming_input = None; }
+                KeyCode::Enter => {
+                    if let Some(ref name) = self.naming_input.clone() {
+                        if !name.is_empty() {
+                            if self.naming_what == "project" {
+                                let _ = store.create_project(name);
+                                self.projects = store.list_projects().unwrap_or_default();
+                            } else if let Some(ref proj) = self.current_project {
+                                let _ = store.create_thread(proj, name);
+                                self.threads = store.list_threads(proj).unwrap_or_default();
+                            }
+                        }
+                    }
+                    self.naming_input = None;
+                }
+                KeyCode::Char(c) => {
+                    if let Some(ref mut input) = self.naming_input {
+                        input.push(c);
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(ref mut input) = self.naming_input {
+                        input.pop();
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.current_project.is_some() {
@@ -141,15 +209,13 @@ impl PromptPanel {
                 }
             }
             KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.current_project.is_none() {
-                    let name = format!("project-{}", self.projects.len() + 1);
-                    let _ = store.create_project(&name);
-                    self.projects = store.list_projects().unwrap_or_default();
-                } else if let Some(ref proj) = self.current_project {
-                    let name = format!("thread-{}", self.threads.len() + 1);
-                    let _ = store.create_thread(proj, &name);
-                    self.threads = store.list_threads(proj).unwrap_or_default();
-                }
+                // Create new project or thread with naming
+                self.naming_input = Some(String::new());
+                self.naming_what = if self.current_project.is_none() {
+                    "project".to_string()
+                } else {
+                    "thread".to_string()
+                };
             }
             _ => {}
         }

@@ -44,6 +44,27 @@ pub struct App {
 
     /// Go to line overlay
     pub goto_line_input: Option<String>,
+
+    /// Save As overlay
+    pub save_as_input: Option<String>,
+
+    /// Menu bar state
+    pub menu: Option<MenuState>,
+
+    /// Auto-save interval tracking
+    pub last_autosave: std::time::Instant,
+
+    /// Panel size ratios (explorer_width, right_pane_percent)
+    pub explorer_width: u16,
+    pub right_pane_percent: u16,
+}
+
+#[derive(Debug, Clone)]
+pub struct MenuState {
+    pub active_menu: usize,   // 0=File, 1=Edit, 2=View
+    pub selected_item: usize,
+    #[allow(dead_code)]
+    pub open: bool,
 }
 
 /// Side-by-side split editor state
@@ -108,6 +129,11 @@ impl App {
             last_click: None,
             overlay: None,
             goto_line_input: None,
+            save_as_input: None,
+            menu: None,
+            last_autosave: std::time::Instant::now(),
+            explorer_width: 30,
+            right_pane_percent: 50,
         })
     }
 
@@ -157,6 +183,48 @@ impl App {
             PanelId::Prompt => self.prompt_panel.handle_key(key, &mut self.llm, &mut self.store),
             PanelId::Terminal => {},
         }
+    }
+
+    /// Auto-save modified buffers (called periodically from main loop)
+    pub fn auto_save(&mut self) {
+        if self.last_autosave.elapsed().as_secs() < 30 {
+            return;
+        }
+        self.last_autosave = std::time::Instant::now();
+
+        // Save current buffer if it has a path and is modified
+        if let Some(ref path) = self.code_panel.file_path {
+            if self.code_panel.buffer.modified {
+                let content = self.code_panel.buffer.to_string();
+                if std::fs::write(path, &content).is_ok() {
+                    self.code_panel.buffer.modified = false;
+                }
+            }
+        }
+
+        // Save stashed buffers
+        let paths: Vec<String> = self.code_panel.open_buffers.keys().cloned().collect();
+        for path in paths {
+            if let Some(buf) = self.code_panel.open_buffers.get_mut(&path) {
+                if buf.modified {
+                    let content = buf.to_string();
+                    if std::fs::write(&path, &content).is_ok() {
+                        buf.modified = false;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Adjust panel size with keyboard (Ctrl+Alt+Left/Right)
+    pub fn adjust_explorer_width(&mut self, delta: i16) {
+        let new_width = (self.explorer_width as i16 + delta).clamp(15, 60) as u16;
+        self.explorer_width = new_width;
+    }
+
+    pub fn adjust_right_pane(&mut self, delta: i16) {
+        let new_pct = (self.right_pane_percent as i16 + delta).clamp(20, 80) as u16;
+        self.right_pane_percent = new_pct;
     }
 
     pub fn poll_llm_updates(&mut self) {
@@ -505,7 +573,31 @@ impl App {
 
                     match panel_id {
                         PanelId::Editor => {
-                            click_to_cursor(&mut self.code_panel.buffer, lx, ly, 5, true);
+                            // Check if clicking on tab bar (first row of editor panel after border)
+                            let tabs = self.code_panel.open_buffer_paths();
+                            if ly == 0 && tabs.len() > 0 {
+                                // Estimate which tab was clicked based on x position
+                                let mut tab_x: u16 = 0;
+                                let offset = if self.code_panel.tab_scroll > 0 { 2 } else { 0 };
+                                tab_x += offset;
+                                for (_i, path) in tabs.iter().skip(self.code_panel.tab_scroll).enumerate() {
+                                    let name_len = std::path::Path::new(path)
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or(path)
+                                        .len() as u16;
+                                    let tab_width = name_len + 4; // " name● " + "│"
+                                    if lx >= tab_x && lx < tab_x + tab_width {
+                                        self.code_panel.switch_to_buffer(path);
+                                        break;
+                                    }
+                                    tab_x += tab_width + 1; // +1 for separator
+                                }
+                            } else {
+                                // Adjust for tab bar + status bar
+                                let adjusted_ly = ly.saturating_sub(1); // tab bar
+                                click_to_cursor(&mut self.code_panel.buffer, lx, adjusted_ly, 5, true);
+                            }
                         }
                         PanelId::Explorer => {
                             let idx = ly as usize + self.code_panel.tree_scroll;
@@ -528,8 +620,14 @@ impl App {
                         }
                         PanelId::Prompt => {
                             use crate::panels::prompt::PromptView;
-                            if self.prompt_panel.view == PromptView::Compose {
-                                click_to_cursor(&mut self.prompt_panel.compose, lx, ly, 0, true);
+                            match self.prompt_panel.view {
+                                PromptView::Compose => {
+                                    click_to_cursor(&mut self.prompt_panel.compose, lx, ly, 0, true);
+                                }
+                                PromptView::Browser => {
+                                    self.prompt_panel.handle_browser_click(lx, ly, &mut self.store);
+                                }
+                                _ => {}
                             }
                         }
                         PanelId::Llm => {}

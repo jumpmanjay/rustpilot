@@ -17,7 +17,7 @@ impl SyntaxHighlighter {
         Self {
             syntax_set: SyntaxSet::load_defaults_newlines(),
             theme_set: ThemeSet::load_defaults(),
-            theme_name: "base16-eighties.dark".to_string(),
+            theme_name: "Monokai Extended".to_string(),
         }
     }
 
@@ -61,5 +61,24 @@ impl SyntaxHighlighter {
 
 fn syn_to_ratatui(style: SynStyle) -> Style {
     let fg = style.foreground;
-    Style::default().fg(Color::Rgb(fg.r, fg.g, fg.b))
+    // Use direct RGB — works in truecolor terminals.
+    // For xterm-256 fallback, we could map to nearest 256-color,
+    // but most modern terminals support truecolor.
+    Style::default().fg(Color::Rgb(
+        saturate(fg.r),
+        saturate(fg.g),
+        saturate(fg.b),
+    ))
+}
+
+/// Boost muted colors to be more vibrant on dark backgrounds
+fn saturate(c: u8) -> u8 {
+    // Lift dark colors slightly so they're visible, and boost mid-range
+    if c < 60 {
+        c.saturating_add(30)
+    } else if c < 180 {
+        c.saturating_add(15)
+    } else {
+        c
+    }
 }

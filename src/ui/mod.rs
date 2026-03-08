@@ -81,8 +81,24 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         return;
     }
 
-    let area = f.area();
+    let full_area = f.area();
     app.panel_rects.clear();
+
+    // Menu bar (1 row at top)
+    let has_menu = true; // always show menu bar
+    let (menu_area, area) = if has_menu {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(full_area);
+        (Some(chunks[0]), chunks[1])
+    } else {
+        (None, full_area)
+    };
+
+    if let Some(ma) = menu_area {
+        draw_menu_bar(f, app, ma);
+    }
 
     let show_explorer = app.visible[PanelId::Explorer as usize];
     let show_editor = app.visible[PanelId::Editor as usize];
@@ -98,20 +114,22 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         return;
     }
 
-    // Build horizontal constraints
+    // Build horizontal constraints (using configurable sizes)
     let mut h_constraints = Vec::new();
-    let mut h_panels: Vec<&str> = Vec::new(); // track what's in each slot
+    let mut h_panels: Vec<&str> = Vec::new();
 
     if show_explorer {
-        h_constraints.push(Constraint::Length(30)); // fixed-width sidebar
+        h_constraints.push(Constraint::Length(app.explorer_width));
         h_panels.push("explorer");
     }
     if show_editor {
-        h_constraints.push(Constraint::Percentage(if show_right { 50 } else { 100 }));
+        let pct = if show_right { 100 - app.right_pane_percent } else { 100 };
+        h_constraints.push(Constraint::Percentage(pct));
         h_panels.push("editor");
     }
     if show_right {
-        h_constraints.push(Constraint::Percentage(if show_editor { 50 } else { 100 }));
+        let pct = if show_editor { app.right_pane_percent } else { 100 };
+        h_constraints.push(Constraint::Percentage(pct));
         h_panels.push("right");
     }
 
@@ -201,6 +219,34 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_overlay(f, app);
     }
 
+    // Save As overlay
+    if let Some(ref input) = app.save_as_input {
+        let area = f.area();
+        let width = 50u16;
+        let height = 3u16;
+        let popup = Rect::new(
+            area.x + (area.width.saturating_sub(width)) / 2,
+            area.y + 2,
+            width,
+            height,
+        );
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(" Save As ");
+        f.render_widget(Clear, popup);
+        let text = format!("{}", input);
+        f.render_widget(
+            Paragraph::new(text).block(block),
+            popup,
+        );
+    }
+
+    // Menu dropdown
+    if let Some(ref menu) = app.menu {
+        draw_menu_dropdown(f, menu);
+    }
+
     // Go-to-line overlay
     if let Some(ref input) = app.goto_line_input {
         let area = f.area();
@@ -223,6 +269,108 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             popup,
         );
     }
+}
+
+// ─── Menu Bar ───
+
+fn draw_menu_bar(f: &mut Frame, app: &App, area: Rect) {
+    let menus = ["  File ", " Edit ", " View "];
+    let is_open = app.menu.is_some();
+    let active = app.menu.as_ref().map(|m| m.active_menu).unwrap_or(usize::MAX);
+
+    let mut spans = Vec::new();
+    for (i, label) in menus.iter().enumerate() {
+        let style = if is_open && i == active {
+            Style::default().fg(Color::Black).bg(Color::White)
+        } else {
+            Style::default().fg(Color::Gray).bg(Color::Rgb(30, 30, 40))
+        };
+        spans.push(Span::styled(*label, style));
+    }
+
+    // Fill rest of bar
+    let used: usize = menus.iter().map(|m| m.len()).sum();
+    let remaining = (area.width as usize).saturating_sub(used);
+    spans.push(Span::styled(
+        " ".repeat(remaining),
+        Style::default().bg(Color::Rgb(30, 30, 40)),
+    ));
+
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn draw_menu_dropdown(f: &mut Frame, menu: &crate::app::MenuState) {
+    let items: Vec<Vec<(&str, &str)>> = vec![
+        // File
+        vec![
+            ("New File", "Ctrl+N"),
+            ("Open File", "Ctrl+P"),
+            ("Save", "Ctrl+S"),
+            ("Save As...", "Ctrl+Shift+S"),
+            ("Close Tab", "Ctrl+W"),
+            ("Quit", "Ctrl+Q"),
+        ],
+        // Edit
+        vec![
+            ("Undo", "Ctrl+Z"),
+            ("Redo", "Ctrl+Y"),
+            ("Copy", "Ctrl+C"),
+            ("Cut", "Ctrl+X"),
+            ("Paste", "Ctrl+V"),
+            ("Select All", "Ctrl+A"),
+        ],
+        // View
+        vec![
+            ("Toggle Explorer", "Alt+F1"),
+            ("Toggle LLM Panel", "Alt+F3"),
+            ("Toggle Prompt Panel", "Alt+F4"),
+            ("Toggle Terminal", "Ctrl+`"),
+            ("Toggle Hidden Files", ""),
+        ],
+    ];
+
+    let active = menu.active_menu.min(items.len() - 1);
+    let menu_items = &items[active];
+
+    let width = 30u16;
+    let height = (menu_items.len() + 2) as u16;
+    let x_offset: u16 = match active {
+        0 => 0,
+        1 => 7,
+        2 => 14,
+        _ => 0,
+    };
+
+    let popup = Rect::new(x_offset, 1, width, height);
+    f.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Gray));
+
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let lines: Vec<Line> = menu_items
+        .iter()
+        .enumerate()
+        .map(|(i, (label, shortcut))| {
+            let style = if i == menu.selected_item {
+                Style::default().fg(Color::Black).bg(Color::White)
+            } else {
+                Style::default().fg(Color::White)
+            };
+
+            let pad = (inner.width as usize).saturating_sub(label.len() + shortcut.len() + 1);
+            Line::from(vec![
+                Span::styled(format!(" {}", label), style),
+                Span::styled(" ".repeat(pad), style),
+                Span::styled(format!("{} ", shortcut), Style::default().fg(Color::DarkGray).bg(if i == menu.selected_item { Color::White } else { Color::Reset })),
+            ])
+        })
+        .collect();
+
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn panel_border_style(focused: bool) -> Style {
@@ -350,14 +498,31 @@ fn draw_tab_bar(f: &mut Frame, app: &App, area: Rect) {
     let paths = app.code_panel.open_buffer_paths();
     let current = app.code_panel.file_path.as_deref().unwrap_or("");
 
+    if paths.is_empty() && app.code_panel.file_path.is_none() {
+        // Show "untitled"
+        let spans = vec![
+            Span::styled(" untitled● ", Style::default().fg(Color::White).bg(Color::DarkGray)),
+        ];
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
+
     let mut spans = Vec::new();
-    for path in &paths {
+
+    // Left scroll arrow
+    if app.code_panel.tab_scroll > 0 {
+        spans.push(Span::styled("◀ ", Style::default().fg(Color::Yellow)));
+    }
+
+    let visible_paths: Vec<&String> = paths.iter().skip(app.code_panel.tab_scroll).collect();
+
+    for path in &visible_paths {
         let name = std::path::Path::new(path)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or(path);
 
-        let is_modified = if path == current {
+        let is_modified = if path.as_str() == current {
             app.code_panel.buffer.modified
         } else {
             app.code_panel.open_buffers.get(path.as_str()).map_or(false, |b| b.modified)
@@ -369,7 +534,7 @@ fn draw_tab_bar(f: &mut Frame, app: &App, area: Rect) {
             format!(" {} ", name)
         };
 
-        let style = if path == current {
+        let style = if path.as_str() == current {
             Style::default().fg(Color::White).bg(Color::DarkGray)
         } else {
             Style::default().fg(Color::Gray)
@@ -377,6 +542,11 @@ fn draw_tab_bar(f: &mut Frame, app: &App, area: Rect) {
 
         spans.push(Span::styled(label, style));
         spans.push(Span::styled("│", Style::default().fg(Color::Rgb(60, 60, 60))));
+    }
+
+    // Right scroll indicator
+    if app.code_panel.tab_scroll + visible_paths.len() < paths.len() {
+        spans.push(Span::styled(" ▶", Style::default().fg(Color::Yellow)));
     }
 
     f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -860,6 +1030,28 @@ fn draw_prompt_browser(f: &mut Frame, app: &App, area: Rect) {
                     .title_style(Style::default().fg(Color::DarkGray)),
             ),
             area,
+        );
+    }
+
+    // Naming overlay
+    if let Some(ref input) = app.prompt_panel.naming_input {
+        let title = format!(" New {} ", app.prompt_panel.naming_what);
+        let width = 30u16.min(area.width);
+        let height = 3u16;
+        let popup = Rect::new(
+            area.x + (area.width.saturating_sub(width)) / 2,
+            area.y + area.height / 2 - 1,
+            width,
+            height,
+        );
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(title);
+        f.render_widget(Clear, popup);
+        f.render_widget(
+            Paragraph::new(input.as_str()).block(block),
+            popup,
         );
     }
 }
