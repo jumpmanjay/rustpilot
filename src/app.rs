@@ -54,6 +54,9 @@ pub struct App {
     /// Auto-save interval tracking
     pub last_autosave: std::time::Instant,
 
+    /// Context menu (right-click)
+    pub context_menu: Option<ContextMenu>,
+
     /// Panel size ratios (explorer_width, right_pane_percent)
     pub explorer_width: u16,
     pub right_pane_percent: u16,
@@ -65,6 +68,29 @@ pub struct MenuState {
     pub selected_item: usize,
     #[allow(dead_code)]
     pub open: bool,
+}
+
+/// Context menu (right-click)
+#[derive(Debug, Clone)]
+pub struct ContextMenu {
+    pub x: u16,
+    pub y: u16,
+    pub items: Vec<ContextMenuItem>,
+    pub selected: usize,
+    pub source: ContextSource,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContextMenuItem {
+    pub label: String,
+    pub action: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum ContextSource {
+    Explorer { path: String, is_dir: bool },
+    PromptProject { name: String },
+    PromptThread { project: String, name: String },
 }
 
 /// Side-by-side split editor state
@@ -135,6 +161,7 @@ impl App {
             goto_line_input: None,
             save_as_input: None,
             menu: None,
+            context_menu: None,
             last_autosave: std::time::Instant::now(),
             explorer_width: 30,
             right_pane_percent: 50,
@@ -221,6 +248,106 @@ impl App {
     }
 
     /// Adjust panel size with keyboard (Ctrl+Alt+Left/Right)
+    /// Execute a context menu action
+    pub fn execute_context_action(&mut self, action: &str, source: &ContextSource) {
+        use crate::panels::code::{ExplorerNaming, ExplorerNamingKind};
+        match source {
+            ContextSource::Explorer { path, is_dir } => {
+                match action {
+                    "rename" => {
+                        let name = std::path::Path::new(path)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("")
+                            .to_string();
+                        self.code_panel.explorer_naming = Some(ExplorerNaming {
+                            input: name,
+                            kind: ExplorerNamingKind::Rename,
+                            original_path: Some(path.clone()),
+                        });
+                    }
+                    "open" => {
+                        if *is_dir {
+                            self.code_panel.cwd = path.clone();
+                            self.code_panel.selected_idx = 0;
+                            self.code_panel.refresh_entries();
+                        } else {
+                            self.code_panel.open_file(path);
+                            self.focused = PanelId::Editor;
+                        }
+                    }
+                    "new_file" => {
+                        self.code_panel.explorer_naming = Some(ExplorerNaming {
+                            input: String::new(),
+                            kind: ExplorerNamingKind::NewFile,
+                            original_path: None,
+                        });
+                    }
+                    "new_folder" => {
+                        self.code_panel.explorer_naming = Some(ExplorerNaming {
+                            input: String::new(),
+                            kind: ExplorerNamingKind::NewFolder,
+                            original_path: None,
+                        });
+                    }
+                    "ref" => {
+                        self.prompt_panel.insert_reference(&format!("@{}", path), false);
+                    }
+                    "include" => {
+                        self.prompt_panel.insert_reference(&format!("@@{}", path), true);
+                    }
+                    "delete" => {
+                        if *is_dir {
+                            let _ = std::fs::remove_dir(path);
+                        } else {
+                            let _ = std::fs::remove_file(path);
+                        }
+                        self.code_panel.refresh_entries();
+                    }
+                    _ => {}
+                }
+            }
+            ContextSource::PromptProject { name } => {
+                match action {
+                    "open" => {
+                        self.prompt_panel.current_project = Some(name.clone());
+                        self.prompt_panel.threads = self.store.list_threads(name).unwrap_or_default();
+                        self.prompt_panel.selected_thread = 0;
+                    }
+                    "rename" => {
+                        self.prompt_panel.naming_input = Some(name.clone());
+                        self.prompt_panel.naming_what = "rename-project".to_string();
+                    }
+                    "delete" => {
+                        let dir = self.store.project_dir(name);
+                        let _ = std::fs::remove_dir_all(&dir);
+                        self.prompt_panel.projects = self.store.list_projects().unwrap_or_default();
+                    }
+                    _ => {}
+                }
+            }
+            ContextSource::PromptThread { project, name } => {
+                match action {
+                    "open" => {
+                        self.prompt_panel.current_thread = Some(name.clone());
+                        self.prompt_panel.view = crate::panels::prompt::PromptView::Compose;
+                        self.prompt_panel.compose.clear();
+                    }
+                    "rename" => {
+                        self.prompt_panel.naming_input = Some(name.clone());
+                        self.prompt_panel.naming_what = "rename-thread".to_string();
+                    }
+                    "delete" => {
+                        let dir = self.store.threads_dir(project);
+                        let _ = std::fs::remove_file(dir.join(format!("{}.jsonl", name)));
+                        self.prompt_panel.threads = self.store.list_threads(project).unwrap_or_default();
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     pub fn adjust_explorer_width(&mut self, delta: i16) {
         let new_width = (self.explorer_width as i16 + delta).clamp(15, 60) as u16;
         self.explorer_width = new_width;
@@ -562,6 +689,26 @@ impl App {
 
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                // Context menu click
+                if let Some(ref cm) = self.context_menu.clone() {
+                    let menu_width: u16 = 22;
+                    let menu_height = cm.items.len() as u16 + 2; // borders
+                    if x >= cm.x && x < cm.x + menu_width
+                        && y >= cm.y && y < cm.y + menu_height
+                    {
+                        let item_idx = (y - cm.y).saturating_sub(1) as usize; // -1 for border
+                        if item_idx < cm.items.len() {
+                            let action = cm.items[item_idx].action.clone();
+                            let source = cm.source.clone();
+                            self.context_menu = None;
+                            self.execute_context_action(&action, &source);
+                            return;
+                        }
+                    }
+                    self.context_menu = None;
+                    // Fall through to normal click handling
+                }
+
                 // Menu bar click (row 0)
                 if y == 0 {
                     let menu_idx = if x < 7 { 0 }       // "  File "
@@ -726,6 +873,90 @@ impl App {
                         }
                         PanelId::Llm => {}
                         PanelId::Terminal => {}
+                    }
+                }
+            }
+            MouseEventKind::Down(MouseButton::Right) => {
+                // Right-click context menu
+                self.context_menu = None; // close any existing
+
+                if let Some((panel_id, rect)) = panel_at {
+                    let lx = x.saturating_sub(rect.x + 1);
+                    let ly = y.saturating_sub(rect.y + 1);
+
+                    match panel_id {
+                        PanelId::Explorer => {
+                            let idx = ly as usize + self.code_panel.tree_scroll;
+                            if idx < self.code_panel.entries.len() {
+                                self.code_panel.selected_idx = idx;
+                                let entry = &self.code_panel.entries[idx];
+                                if entry.name == ".." {
+                                    return;
+                                }
+                                let mut items = vec![
+                                    ContextMenuItem { label: "Rename (F2)".into(), action: "rename".into() },
+                                ];
+                                if entry.is_dir {
+                                    items.push(ContextMenuItem { label: "New File".into(), action: "new_file".into() });
+                                    items.push(ContextMenuItem { label: "New Folder".into(), action: "new_folder".into() });
+                                    items.push(ContextMenuItem { label: "Delete Folder".into(), action: "delete".into() });
+                                } else {
+                                    items.push(ContextMenuItem { label: "Open".into(), action: "open".into() });
+                                    items.push(ContextMenuItem { label: "Add @ref".into(), action: "ref".into() });
+                                    items.push(ContextMenuItem { label: "Add @@include".into(), action: "include".into() });
+                                    items.push(ContextMenuItem { label: "Delete".into(), action: "delete".into() });
+                                }
+                                self.context_menu = Some(ContextMenu {
+                                    x, y,
+                                    items,
+                                    selected: 0,
+                                    source: ContextSource::Explorer {
+                                        path: entry.path.clone(),
+                                        is_dir: entry.is_dir,
+                                    },
+                                });
+                            }
+                        }
+                        PanelId::Prompt => {
+                            use crate::panels::prompt::PromptView;
+                            if self.prompt_panel.view == PromptView::Browser {
+                                if self.prompt_panel.current_project.is_none() {
+                                    let idx = ly as usize;
+                                    if idx < self.prompt_panel.projects.len() {
+                                        self.prompt_panel.selected_project = idx;
+                                        let name = self.prompt_panel.projects[idx].clone();
+                                        self.context_menu = Some(ContextMenu {
+                                            x, y,
+                                            items: vec![
+                                                ContextMenuItem { label: "Open".into(), action: "open".into() },
+                                                ContextMenuItem { label: "Rename (F2)".into(), action: "rename".into() },
+                                                ContextMenuItem { label: "Delete".into(), action: "delete".into() },
+                                            ],
+                                            selected: 0,
+                                            source: ContextSource::PromptProject { name },
+                                        });
+                                    }
+                                } else {
+                                    let idx = ly as usize;
+                                    if idx < self.prompt_panel.threads.len() {
+                                        self.prompt_panel.selected_thread = idx;
+                                        let name = self.prompt_panel.threads[idx].clone();
+                                        let project = self.prompt_panel.current_project.clone().unwrap_or_default();
+                                        self.context_menu = Some(ContextMenu {
+                                            x, y,
+                                            items: vec![
+                                                ContextMenuItem { label: "Open".into(), action: "open".into() },
+                                                ContextMenuItem { label: "Rename (F2)".into(), action: "rename".into() },
+                                                ContextMenuItem { label: "Delete".into(), action: "delete".into() },
+                                            ],
+                                            selected: 0,
+                                            source: ContextSource::PromptThread { project, name },
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }

@@ -118,6 +118,34 @@ async fn run_app(
                     continue;
                 }
 
+                // Handle context menu (right-click)
+                if app.context_menu.is_some() {
+                    match key.code {
+                        KeyCode::Esc => { app.context_menu = None; }
+                        KeyCode::Up => {
+                            if let Some(ref mut cm) = app.context_menu {
+                                cm.selected = cm.selected.saturating_sub(1);
+                            }
+                        }
+                        KeyCode::Down => {
+                            if let Some(ref mut cm) = app.context_menu {
+                                cm.selected = (cm.selected + 1).min(cm.items.len().saturating_sub(1));
+                            }
+                        }
+                        KeyCode::Enter => {
+                            if let Some(cm) = app.context_menu.take() {
+                                if let Some(item) = cm.items.get(cm.selected) {
+                                    let action = item.action.clone();
+                                    let source = cm.source.clone();
+                                    app.execute_context_action(&action, &source);
+                                }
+                            }
+                        }
+                        _ => { app.context_menu = None; }
+                    }
+                    continue;
+                }
+
                 // Handle save-as overlay
                 if app.save_as_input.is_some() {
                     match key.code {

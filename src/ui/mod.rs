@@ -219,6 +219,36 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_overlay(f, app);
     }
 
+    // Context menu (right-click)
+    if let Some(ref cm) = app.context_menu {
+        let width: u16 = 22;
+        let height = cm.items.len() as u16 + 2;
+        let popup_x = cm.x.min(area.width.saturating_sub(width));
+        let popup_y = cm.y.min(area.height.saturating_sub(height));
+        let popup = Rect::new(popup_x, popup_y, width, height);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Gray));
+
+        let inner = block.inner(popup);
+        f.render_widget(Clear, popup);
+        f.render_widget(block, popup);
+
+        let lines: Vec<Line> = cm.items.iter().enumerate().map(|(i, item)| {
+            let style = if i == cm.selected {
+                Style::default().fg(Color::Black).bg(Color::White)
+            } else if item.action == "delete" {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            Line::from(Span::styled(format!(" {} ", item.label), style))
+        }).collect();
+
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
     // Save As overlay
     if let Some(ref input) = app.save_as_input {
         let area = f.area();

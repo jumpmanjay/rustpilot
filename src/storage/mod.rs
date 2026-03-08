@@ -51,11 +51,11 @@ impl Store {
         self.base_dir.join("projects")
     }
 
-    fn project_dir(&self, project: &str) -> PathBuf {
+    pub fn project_dir(&self, project: &str) -> PathBuf {
         self.projects_dir().join(project)
     }
 
-    fn threads_dir(&self, project: &str) -> PathBuf {
+    pub fn threads_dir(&self, project: &str) -> PathBuf {
         self.project_dir(project).join("threads")
     }
 
