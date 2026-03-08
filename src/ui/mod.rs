@@ -1847,14 +1847,18 @@ fn draw_overlay(f: &mut Frame, app: &App) {
 
         Some(Overlay::FindInFile {
             query,
+            replace,
             matches,
             current,
+            case_sensitive,
+            use_regex,
+            editing_replace,
         }) => {
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Yellow))
                 .title(format!(
-                    " Find in File — {}/{} matches ",
+                    " Find & Replace — {}/{} matches ",
                     if matches.is_empty() { 0 } else { *current + 1 },
                     matches.len()
                 ));
@@ -1863,18 +1867,48 @@ fn draw_overlay(f: &mut Frame, app: &App) {
 
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Length(1), Constraint::Min(1)])
+                .constraints([
+                    Constraint::Length(1), // options bar
+                    Constraint::Length(1), // find input
+                    Constraint::Length(1), // replace input
+                    Constraint::Min(1),   // results
+                ])
                 .split(inner);
 
+            // Options bar
+            let case_label = if *case_sensitive { "[Aa✓]" } else { "[Aa]" };
+            let regex_label = if *use_regex { "[.*✓]" } else { "[.*]" };
+            let options = Paragraph::new(Line::from(vec![
+                Span::styled(" Alt+C ", Style::default().fg(if *case_sensitive { Color::Yellow } else { Color::DarkGray })),
+                Span::styled(case_label, Style::default().fg(if *case_sensitive { Color::Yellow } else { Color::DarkGray })),
+                Span::styled("  Alt+R ", Style::default().fg(if *use_regex { Color::Cyan } else { Color::DarkGray })),
+                Span::styled(regex_label, Style::default().fg(if *use_regex { Color::Cyan } else { Color::DarkGray })),
+                Span::styled("  Tab=switch  Ctrl+H=replace  Ctrl+Alt+Enter=all", Style::default().fg(Color::Rgb(80, 80, 80))),
+            ]));
+            f.render_widget(options, chunks[0]);
+
+            // Find input
+            let find_cursor = if !*editing_replace { "█" } else { "" };
+            let find_style = if !*editing_replace { Color::White } else { Color::DarkGray };
             let input = Paragraph::new(Line::from(vec![
                 Span::styled("🔍 ", Style::default().fg(Color::Yellow)),
-                Span::styled(query.as_str(), Style::default().fg(Color::White)),
-                Span::styled("█", Style::default().fg(Color::Gray)),
+                Span::styled(query.as_str(), Style::default().fg(find_style)),
+                Span::styled(find_cursor, Style::default().fg(Color::Gray)),
             ]));
-            f.render_widget(input, chunks[0]);
+            f.render_widget(input, chunks[1]);
 
-            // Show matches with context
-            let max_visible = chunks[1].height as usize;
+            // Replace input
+            let replace_cursor = if *editing_replace { "█" } else { "" };
+            let replace_style = if *editing_replace { Color::White } else { Color::DarkGray };
+            let replace_input = Paragraph::new(Line::from(vec![
+                Span::styled("↪ ", Style::default().fg(Color::Green)),
+                Span::styled(replace.as_str(), Style::default().fg(replace_style)),
+                Span::styled(replace_cursor, Style::default().fg(Color::Gray)),
+            ]));
+            f.render_widget(replace_input, chunks[2]);
+
+            // Matches list
+            let max_visible = chunks[3].height as usize;
             let items: Vec<ListItem> = matches
                 .iter()
                 .enumerate()
@@ -1898,13 +1932,17 @@ fn draw_overlay(f: &mut Frame, app: &App) {
                     )))
                 })
                 .collect();
-            f.render_widget(List::new(items), chunks[1]);
+            f.render_widget(List::new(items), chunks[3]);
         }
 
         Some(Overlay::FindInWorkspace {
             query,
             results,
             selected,
+            case_sensitive,
+            use_regex,
+            file_pattern,
+            editing_pattern,
         }) => {
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -1915,17 +1953,52 @@ fn draw_overlay(f: &mut Frame, app: &App) {
 
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Length(1), Constraint::Min(1)])
+                .constraints([
+                    Constraint::Length(1), // options bar
+                    Constraint::Length(1), // query input
+                    Constraint::Length(1), // file pattern
+                    Constraint::Min(1),   // results
+                ])
                 .split(inner);
 
+            // Options bar
+            let case_label = if *case_sensitive { "[Aa✓]" } else { "[Aa]" };
+            let regex_label = if *use_regex { "[.*✓]" } else { "[.*]" };
+            let options = Paragraph::new(Line::from(vec![
+                Span::styled(" Alt+C ", Style::default().fg(if *case_sensitive { Color::Yellow } else { Color::DarkGray })),
+                Span::styled(case_label, Style::default().fg(if *case_sensitive { Color::Yellow } else { Color::DarkGray })),
+                Span::styled("  Alt+R ", Style::default().fg(if *use_regex { Color::Cyan } else { Color::DarkGray })),
+                Span::styled(regex_label, Style::default().fg(if *use_regex { Color::Cyan } else { Color::DarkGray })),
+                Span::styled("  Tab=files filter", Style::default().fg(Color::Rgb(80, 80, 80))),
+            ]));
+            f.render_widget(options, chunks[0]);
+
+            // Query input
+            let q_cursor = if !*editing_pattern { "█" } else { "" };
+            let q_style = if !*editing_pattern { Color::White } else { Color::DarkGray };
             let input = Paragraph::new(Line::from(vec![
                 Span::styled("🔍 ", Style::default().fg(Color::Magenta)),
-                Span::styled(query.as_str(), Style::default().fg(Color::White)),
-                Span::styled("█", Style::default().fg(Color::Gray)),
+                Span::styled(query.as_str(), Style::default().fg(q_style)),
+                Span::styled(q_cursor, Style::default().fg(Color::Gray)),
             ]));
-            f.render_widget(input, chunks[0]);
+            f.render_widget(input, chunks[1]);
 
-            let max_visible = chunks[1].height as usize;
+            // File pattern input
+            let p_cursor = if *editing_pattern { "█" } else { "" };
+            let p_style = if *editing_pattern { Color::White } else { Color::DarkGray };
+            let pattern_text = if file_pattern.is_empty() && !*editing_pattern {
+                "*.* (all files)"
+            } else {
+                file_pattern.as_str()
+            };
+            let pattern_input = Paragraph::new(Line::from(vec![
+                Span::styled("📁 ", Style::default().fg(Color::Blue)),
+                Span::styled(pattern_text, Style::default().fg(p_style)),
+                Span::styled(p_cursor, Style::default().fg(Color::Gray)),
+            ]));
+            f.render_widget(pattern_input, chunks[2]);
+
+            let max_visible = chunks[3].height as usize;
             let items: Vec<ListItem> = results
                 .iter()
                 .enumerate()
@@ -1942,7 +2015,6 @@ fn draw_overlay(f: &mut Frame, app: &App) {
                         result.line_num,
                         result.line_text.trim()
                     );
-                    // Truncate long lines
                     let truncated = if text.len() > width as usize - 4 {
                         format!("{}…", &text[..width as usize - 5])
                     } else {

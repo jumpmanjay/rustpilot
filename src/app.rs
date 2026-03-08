@@ -109,13 +109,21 @@ pub enum Overlay {
     },
     FindInFile {
         query: String,
+        replace: String,
         matches: Vec<(usize, usize)>, // (row, col)
         current: usize,
+        case_sensitive: bool,
+        use_regex: bool,
+        editing_replace: bool, // true = typing in replace field
     },
     FindInWorkspace {
         query: String,
         results: Vec<GrepResult>,
         selected: usize,
+        case_sensitive: bool,
+        use_regex: bool,
+        file_pattern: String, // e.g. "*.rs"
+        editing_pattern: bool, // true = typing in file pattern field
     },
 }
 
@@ -509,23 +517,51 @@ impl App {
     pub fn open_find_in_file(&mut self) {
         self.overlay = Some(Overlay::FindInFile {
             query: String::new(),
+            replace: String::new(),
             matches: Vec::new(),
             current: 0,
+            case_sensitive: false,
+            use_regex: false,
+            editing_replace: false,
         });
     }
 
-    fn find_in_file_search(lines: &[String], query: &str) -> Vec<(usize, usize)> {
+    fn find_in_file_search(lines: &[String], query: &str, case_sensitive: bool, use_regex: bool) -> Vec<(usize, usize)> {
         if query.is_empty() {
             return Vec::new();
         }
-        let query_lower = query.to_lowercase();
         let mut matches = Vec::new();
-        for (row, line) in lines.iter().enumerate() {
-            let line_lower = line.to_lowercase();
-            let mut start = 0;
-            while let Some(pos) = line_lower[start..].find(&query_lower) {
-                matches.push((row, start + pos));
-                start += pos + query_lower.len();
+
+        if use_regex {
+            let pattern = if case_sensitive {
+                regex::Regex::new(query)
+            } else {
+                regex::Regex::new(&format!("(?i){}", query))
+            };
+            if let Ok(re) = pattern {
+                for (row, line) in lines.iter().enumerate() {
+                    for m in re.find_iter(line) {
+                        matches.push((row, m.start()));
+                    }
+                }
+            }
+        } else if case_sensitive {
+            for (row, line) in lines.iter().enumerate() {
+                let mut start = 0;
+                while let Some(pos) = line[start..].find(query) {
+                    matches.push((row, start + pos));
+                    start += pos + query.len();
+                }
+            }
+        } else {
+            let query_lower = query.to_lowercase();
+            for (row, line) in lines.iter().enumerate() {
+                let line_lower = line.to_lowercase();
+                let mut start = 0;
+                while let Some(pos) = line_lower[start..].find(&query_lower) {
+                    matches.push((row, start + pos));
+                    start += pos + query_lower.len();
+                }
             }
         }
         matches
@@ -538,24 +574,46 @@ impl App {
             query: String::new(),
             results: Vec::new(),
             selected: 0,
+            case_sensitive: false,
+            use_regex: false,
+            file_pattern: String::new(),
+            editing_pattern: false,
         });
     }
 
-    fn find_in_workspace_search(cwd: &str, query: &str) -> Vec<GrepResult> {
+    fn find_in_workspace_search(cwd: &str, query: &str, case_sensitive: bool, use_regex: bool, file_pattern: &str) -> Vec<GrepResult> {
         use ignore::WalkBuilder;
 
         if query.is_empty() {
             return Vec::new();
         }
-        let query_lower = query.to_lowercase();
         let mut results = Vec::new();
 
-        let walker = WalkBuilder::new(cwd)
-            .hidden(true)
-            .max_depth(Some(10))
-            .build();
+        let mut walker_builder = WalkBuilder::new(cwd);
+        walker_builder.hidden(true).max_depth(Some(10));
 
-        for entry in walker.flatten() {
+        // Apply file pattern filter
+        if !file_pattern.is_empty() {
+            let mut overrides = ignore::overrides::OverrideBuilder::new(cwd);
+            let _ = overrides.add(file_pattern);
+            if let Ok(ov) = overrides.build() {
+                walker_builder.overrides(ov);
+            }
+        }
+
+        let re = if use_regex {
+            if case_sensitive {
+                regex::Regex::new(query).ok()
+            } else {
+                regex::Regex::new(&format!("(?i){}", query)).ok()
+            }
+        } else {
+            None
+        };
+
+        let query_lower = if !case_sensitive { query.to_lowercase() } else { String::new() };
+
+        for entry in walker_builder.build().flatten() {
             if entry.file_type().map_or(true, |ft| ft.is_dir()) {
                 continue;
             }
@@ -568,7 +626,14 @@ impl App {
                     .trim_start_matches('/')
                     .to_string();
                 for (i, line) in content.lines().enumerate() {
-                    if line.to_lowercase().contains(&query_lower) {
+                    let matches = if let Some(ref re) = re {
+                        re.is_match(line)
+                    } else if case_sensitive {
+                        line.contains(query)
+                    } else {
+                        line.to_lowercase().contains(&query_lower)
+                    };
+                    if matches {
                         results.push(GrepResult {
                             path: relative.clone(),
                             line_num: i + 1,
@@ -632,10 +697,59 @@ impl App {
 
             Some(Overlay::FindInFile {
                 ref mut query,
+                ref mut replace,
                 ref mut matches,
                 ref mut current,
+                ref mut case_sensitive,
+                ref mut use_regex,
+                ref mut editing_replace,
             }) => {
+                let ctrl = key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
+                let alt = key.modifiers.contains(crossterm::event::KeyModifiers::ALT);
                 match key.code {
+                    // Alt+C: toggle case sensitive
+                    KeyCode::Char('c') if alt => {
+                        *case_sensitive = !*case_sensitive;
+                        *matches = Self::find_in_file_search(&self.code_panel.buffer.lines, query, *case_sensitive, *use_regex);
+                        *current = 0;
+                    }
+                    // Alt+R: toggle regex
+                    KeyCode::Char('r') if alt => {
+                        *use_regex = !*use_regex;
+                        *matches = Self::find_in_file_search(&self.code_panel.buffer.lines, query, *case_sensitive, *use_regex);
+                        *current = 0;
+                    }
+                    // Tab: switch between find/replace fields
+                    KeyCode::Tab => {
+                        *editing_replace = !*editing_replace;
+                    }
+                    // Ctrl+Shift+1: replace current match
+                    KeyCode::Char('h') if ctrl => {
+                        if let Some(&(row, col)) = matches.get(*current) {
+                            let line = &mut self.code_panel.buffer.lines[row];
+                            let end = (col + query.len()).min(line.len());
+                            line.replace_range(col..end, replace);
+                            self.code_panel.buffer.modified = true;
+                            *matches = Self::find_in_file_search(&self.code_panel.buffer.lines, query, *case_sensitive, *use_regex);
+                            if *current >= matches.len() { *current = 0; }
+                        }
+                    }
+                    // Ctrl+Alt+Enter: replace all
+                    KeyCode::Enter if ctrl && alt => {
+                        // Replace all matches (from bottom to top to preserve positions)
+                        let mut sorted = matches.clone();
+                        sorted.reverse();
+                        for (row, col) in sorted {
+                            let line = &mut self.code_panel.buffer.lines[row];
+                            let end = (col + query.len()).min(line.len());
+                            line.replace_range(col..end, replace);
+                        }
+                        if !matches.is_empty() {
+                            self.code_panel.buffer.modified = true;
+                        }
+                        *matches = Self::find_in_file_search(&self.code_panel.buffer.lines, query, *case_sensitive, *use_regex);
+                        *current = 0;
+                    }
                     KeyCode::Enter => {
                         if let Some(&(row, col)) = matches.get(*current) {
                             self.code_panel.buffer.cursor_row = row;
@@ -666,21 +780,29 @@ impl App {
                         }
                     }
                     KeyCode::Backspace => {
-                        query.pop();
-                        *matches = Self::find_in_file_search(&self.code_panel.buffer.lines, query);
-                        *current = 0;
-                        if let Some(&(row, col)) = matches.first() {
-                            self.code_panel.buffer.cursor_row = row;
-                            self.code_panel.buffer.cursor_col = col;
+                        if *editing_replace {
+                            replace.pop();
+                        } else {
+                            query.pop();
+                            *matches = Self::find_in_file_search(&self.code_panel.buffer.lines, query, *case_sensitive, *use_regex);
+                            *current = 0;
+                            if let Some(&(row, col)) = matches.first() {
+                                self.code_panel.buffer.cursor_row = row;
+                                self.code_panel.buffer.cursor_col = col;
+                            }
                         }
                     }
-                    KeyCode::Char(c) => {
-                        query.push(c);
-                        *matches = Self::find_in_file_search(&self.code_panel.buffer.lines, query);
-                        *current = 0;
-                        if let Some(&(row, col)) = matches.first() {
-                            self.code_panel.buffer.cursor_row = row;
-                            self.code_panel.buffer.cursor_col = col;
+                    KeyCode::Char(c) if !ctrl && !alt => {
+                        if *editing_replace {
+                            replace.push(c);
+                        } else {
+                            query.push(c);
+                            *matches = Self::find_in_file_search(&self.code_panel.buffer.lines, query, *case_sensitive, *use_regex);
+                            *current = 0;
+                            if let Some(&(row, col)) = matches.first() {
+                                self.code_panel.buffer.cursor_row = row;
+                                self.code_panel.buffer.cursor_col = col;
+                            }
                         }
                     }
                     _ => {}
@@ -691,8 +813,33 @@ impl App {
                 ref mut query,
                 ref mut results,
                 ref mut selected,
+                ref mut case_sensitive,
+                ref mut use_regex,
+                ref mut file_pattern,
+                ref mut editing_pattern,
             }) => {
+                let ctrl = key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
+                let alt = key.modifiers.contains(crossterm::event::KeyModifiers::ALT);
                 match key.code {
+                    KeyCode::Char('c') if alt => {
+                        *case_sensitive = !*case_sensitive;
+                        *results = Self::find_in_workspace_search(&self.code_panel.cwd, query, *case_sensitive, *use_regex, file_pattern);
+                        *selected = 0;
+                    }
+                    KeyCode::Char('r') if alt => {
+                        *use_regex = !*use_regex;
+                        *results = Self::find_in_workspace_search(&self.code_panel.cwd, query, *case_sensitive, *use_regex, file_pattern);
+                        *selected = 0;
+                    }
+                    KeyCode::Tab => {
+                        *editing_pattern = !*editing_pattern;
+                    }
+                    KeyCode::Enter if *editing_pattern => {
+                        // Apply pattern and switch back to query
+                        *editing_pattern = false;
+                        *results = Self::find_in_workspace_search(&self.code_panel.cwd, query, *case_sensitive, *use_regex, file_pattern);
+                        *selected = 0;
+                    }
                     KeyCode::Enter => {
                         if let Some(result) = results.get(*selected).cloned() {
                             let full_path = format!("{}/{}", self.code_panel.cwd, result.path);
@@ -703,21 +850,29 @@ impl App {
                         }
                         self.overlay = None;
                     }
-                    KeyCode::Up => *selected = selected.saturating_sub(1),
-                    KeyCode::Down => {
+                    KeyCode::Up if !*editing_pattern => *selected = selected.saturating_sub(1),
+                    KeyCode::Down if !*editing_pattern => {
                         if *selected + 1 < results.len() {
                             *selected += 1;
                         }
                     }
                     KeyCode::Backspace => {
-                        query.pop();
-                        *results = Self::find_in_workspace_search(&self.code_panel.cwd, query);
-                        *selected = 0;
+                        if *editing_pattern {
+                            file_pattern.pop();
+                        } else {
+                            query.pop();
+                            *results = Self::find_in_workspace_search(&self.code_panel.cwd, query, *case_sensitive, *use_regex, file_pattern);
+                            *selected = 0;
+                        }
                     }
-                    KeyCode::Char(c) => {
-                        query.push(c);
-                        *results = Self::find_in_workspace_search(&self.code_panel.cwd, query);
-                        *selected = 0;
+                    KeyCode::Char(c) if !ctrl && !alt => {
+                        if *editing_pattern {
+                            file_pattern.push(c);
+                        } else {
+                            query.push(c);
+                            *results = Self::find_in_workspace_search(&self.code_panel.cwd, query, *case_sensitive, *use_regex, file_pattern);
+                            *selected = 0;
+                        }
                     }
                     _ => {}
                 }
