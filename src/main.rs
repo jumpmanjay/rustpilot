@@ -288,7 +288,13 @@ async fn run_app(
                     continue;
                 }
 
-                // F10 / F1 = menu
+                // Shift+F10: context menu for focused panel
+                if key.code == KeyCode::F(10) && key.modifiers.contains(KeyModifiers::SHIFT) {
+                    app.open_context_menu_for_focused();
+                    continue;
+                }
+
+                // F10 / F1 = menu bar
                 if matches!(key.code, KeyCode::F(10) | KeyCode::F(1)) && !key.modifiers.contains(KeyModifiers::ALT) {
                     app.menu = Some(app::MenuState { active_menu: 0, selected_item: 0, open: true });
                     continue;

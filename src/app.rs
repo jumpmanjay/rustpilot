@@ -348,6 +348,79 @@ impl App {
         }
     }
 
+    /// Open context menu for the currently focused panel (keyboard shortcut)
+    pub fn open_context_menu_for_focused(&mut self) {
+        // Find the panel rect for positioning
+        let rect = self.panel_rects.iter()
+            .find(|(id, _)| *id == self.focused)
+            .map(|(_, r)| *r);
+        let (cx, cy) = rect.map_or((10, 5), |r| (r.x + r.width / 3, r.y + r.height / 3));
+
+        match self.focused {
+            PanelId::Explorer => {
+                if let Some(entry) = self.code_panel.entries.get(self.code_panel.selected_idx) {
+                    if entry.name == ".." { return; }
+                    let mut items = vec![
+                        ContextMenuItem { label: "Rename (F2)".into(), action: "rename".into() },
+                    ];
+                    if entry.is_dir {
+                        items.push(ContextMenuItem { label: "New File".into(), action: "new_file".into() });
+                        items.push(ContextMenuItem { label: "New Folder".into(), action: "new_folder".into() });
+                        items.push(ContextMenuItem { label: "Delete Folder".into(), action: "delete".into() });
+                    } else {
+                        items.push(ContextMenuItem { label: "Open".into(), action: "open".into() });
+                        items.push(ContextMenuItem { label: "Add @ref".into(), action: "ref".into() });
+                        items.push(ContextMenuItem { label: "Add @@include".into(), action: "include".into() });
+                        items.push(ContextMenuItem { label: "Delete".into(), action: "delete".into() });
+                    }
+                    self.context_menu = Some(ContextMenu {
+                        x: cx, y: cy,
+                        items,
+                        selected: 0,
+                        source: ContextSource::Explorer {
+                            path: entry.path.clone(),
+                            is_dir: entry.is_dir,
+                        },
+                    });
+                }
+            }
+            PanelId::Prompt => {
+                use crate::panels::prompt::PromptView;
+                if self.prompt_panel.view == PromptView::Browser {
+                    if self.prompt_panel.current_project.is_none() {
+                        if let Some(name) = self.prompt_panel.projects.get(self.prompt_panel.selected_project).cloned() {
+                            self.context_menu = Some(ContextMenu {
+                                x: cx, y: cy,
+                                items: vec![
+                                    ContextMenuItem { label: "Open".into(), action: "open".into() },
+                                    ContextMenuItem { label: "Rename (F2)".into(), action: "rename".into() },
+                                    ContextMenuItem { label: "Delete".into(), action: "delete".into() },
+                                ],
+                                selected: 0,
+                                source: ContextSource::PromptProject { name },
+                            });
+                        }
+                    } else {
+                        if let Some(name) = self.prompt_panel.threads.get(self.prompt_panel.selected_thread).cloned() {
+                            let project = self.prompt_panel.current_project.clone().unwrap_or_default();
+                            self.context_menu = Some(ContextMenu {
+                                x: cx, y: cy,
+                                items: vec![
+                                    ContextMenuItem { label: "Open".into(), action: "open".into() },
+                                    ContextMenuItem { label: "Rename (F2)".into(), action: "rename".into() },
+                                    ContextMenuItem { label: "Delete".into(), action: "delete".into() },
+                                ],
+                                selected: 0,
+                                source: ContextSource::PromptThread { project, name },
+                            });
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn adjust_explorer_width(&mut self, delta: i16) {
         let new_width = (self.explorer_width as i16 + delta).clamp(15, 60) as u16;
         self.explorer_width = new_width;
